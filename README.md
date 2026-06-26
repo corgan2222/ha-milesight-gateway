@@ -1,6 +1,6 @@
 # Milesight Gateway — Home Assistant Integration
 
-[![GitHub Repository](https://img.shields.io/badge/GitHub-corgan2222%2Fmilesight__gateway-blue?logo=github)](https://github.com/corgan2222/milesight_gateway)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-corgan2222%2Fha-milesight-gateway-blue?logo=github)](https://github.com/corgan2222/ha-milesight-gateway)
 
 
 A custom Home Assistant integration that bridges **Milesight LoRaWAN gateways** with Home Assistant, providing real-time sensor data from 130+ Milesight LoRaWAN devices.
@@ -47,7 +47,7 @@ then
 
 1. Open HACS in your Home Assistant sidebar.
 2. Go to **Integrations** → click the three-dot menu → **Custom repositories**.
-3. Add this repository URL https://github.com/corgan2222/milesight_gateway with category **Integration**.
+3. Add this repository URL https://github.com/corgan2222/ha-milesight-gateway with category **Integration**.
 4. Search for **Milesight Gateway** and install it.
 5. Restart Home Assistant.
 
