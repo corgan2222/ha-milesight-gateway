@@ -1,4 +1,7 @@
-<img src="https://raw.githubusercontent.com/corgan2222/ha-milesight-gateway/main/images/header.png" alt="Milesight Gateway — Home Assistant Integration" width="100%" />
+<p align="center">
+  <img src="https://raw.githubusercontent.com/corgan2222/ha-milesight-gateway/main/images/header.png" alt="Milesight Gateway — Home Assistant Integration" />
+</p>
+
 
 # Milesight Gateway — Home Assistant Integration
 
