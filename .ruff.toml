@@ -15,6 +15,18 @@ ignore = [
     "ISC001", # incompatible with formatter
 ]
 
+[lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the pytest idiom
+    "SLF001",  # tests routinely inspect private state
+    "ANN",     # no annotations required in tests
+    "D",       # no docstrings required in tests
+    "PLR",     # pylint-style rules not enforced in tests
+    "ARG001",  # pytest fixtures are injected for side effects, not always used directly
+    "RET504",  # assignment before return aids test readability
+    "PLC0415", # lazy imports used for patching in some test patterns
+]
+
 [lint.flake8-pytest-style]
 fixture-parentheses = false
 
