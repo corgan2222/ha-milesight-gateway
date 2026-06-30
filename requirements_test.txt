@@ -1,0 +1,4 @@
+# Test dependencies. pytest-homeassistant-custom-component pulls a matching
+# Home Assistant plus pytest, pytest-cov and pytest-asyncio transitively.
+# Pinned to the release that matches homeassistant==2026.6.4 (see requirements.txt).
+pytest-homeassistant-custom-component==0.13.340
