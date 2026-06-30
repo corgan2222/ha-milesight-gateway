@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/corgan2222/ha-milesight-gateway/main/images/header.png" alt="Milesight Gateway — Home Assistant Integration" width="100%" />
+
 # Milesight Gateway — Home Assistant Integration
 
 [![GitHub Repository](https://img.shields.io/badge/GitHub-corgan2222%2Fha-milesight-gateway-blue?logo=github)](https://github.com/corgan2222/ha-milesight-gateway)
