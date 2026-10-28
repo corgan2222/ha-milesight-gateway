@@ -76,10 +76,11 @@ async def async_setup_entry(
     coordinator: MilesightGatewayCoordinator = config_entry.runtime_data.coordinator
     gateway_url = config_entry.data[CONF_GATEWAY_URL]
     port = config_entry.data[CONF_PORT]
-    gateway_id = f"{gateway_url}:{port}"
+    # Keyed on the entry id, not the address, so the device survives an IP change.
+    gateway_id = config_entry.runtime_data.gateway_device_id
     gateway_host = urlparse(gateway_url).hostname or gateway_url
 
-    gateway_device_info = DeviceInfo(identifiers={(DOMAIN, gateway_id)})
+    gateway_device_info = DeviceInfo(identifiers={(DOMAIN, config_entry.entry_id)})
 
     entities: list[SensorEntity] = [
         MilesightOnlineDevicesSensor(coordinator, gateway_device_info),
@@ -103,7 +104,7 @@ async def async_setup_entry(
 
 
 def _device_info(
-    device: MilesightDevice, configuration_url: str, gateway_id: str
+    device: MilesightDevice, configuration_url: str, gateway_device_id: str
 ) -> DeviceInfo:
     """Build DeviceInfo for a LoRaWAN device."""
     return DeviceInfo(
@@ -114,7 +115,7 @@ def _device_info(
         model_id=device.model_id or None,
         serial_number=device.dev_eui,
         configuration_url=configuration_url,
-        via_device=(DOMAIN, gateway_id),
+        via_device_id=gateway_device_id,
     )
 
 

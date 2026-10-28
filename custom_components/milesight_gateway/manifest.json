@@ -10,5 +10,5 @@
   "issue_tracker": "https://github.com/corgan2222/ha-milesight-gateway/issues",
   "quality_scale": "bronze",
   "requirements": ["Milesight-Gateway-API==0.0.1"],
-  "version": "1.0.3"
+  "version": "1.1.0"
 }
