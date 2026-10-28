@@ -386,11 +386,27 @@ class MilesightGatewayAPI:
         self.connected = True
         return True
 
+    async def _fetch_devices(self, session: ClientSession) -> tuple[list[dict], int]:
+        """
+        Fetch the raw device list with a usable device count.
+
+        The gateway reports devTotalCount as a string and the client passes the
+        JSON value through untouched, so it has to be normalised before it can
+        be compared with a length.
+        """
+        all_devices, raw_total = await self._client.get_all_devices(session)
+        try:
+            total_count = int(raw_total)
+        except TypeError, ValueError:
+            _LOGGER.debug("Gateway sent an unusable device count: %r", raw_total)
+            total_count = 0
+        return all_devices, total_count
+
     async def async_get_devices(
         self, session: ClientSession
     ) -> tuple[list[MilesightDevice], int, int]:
         """Fetch devices; return (active_list, online_count, offline_count)."""
-        all_devices, total_count = await self._client.get_all_devices(session)
+        all_devices, total_count = await self._fetch_devices(session)
 
         if not all_devices and not total_count:
             # get_all_devices logs and breaks out of its pagination loop on any
@@ -399,7 +415,7 @@ class MilesightGatewayAPI:
             # catches the subset where the token is the problem, and recovers
             # from an expired one.
             await self.async_connect(session)
-            all_devices, total_count = await self._client.get_all_devices(session)
+            all_devices, total_count = await self._fetch_devices(session)
 
         if not all_devices and not total_count and self._devices_seen:
             # This gateway has reported devices before, so an empty list now is
