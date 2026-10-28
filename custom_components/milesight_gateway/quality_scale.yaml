@@ -23,11 +23,7 @@ rules:
       DeviceInfo helper.
   config-flow-test-coverage: done
   config-flow: done
-  dependency-transparency:
-    status: todo
-    comment: >-
-      Milesight-Gateway-API is on PyPI under MIT with public source, but the
-      upstream repository has no 0.0.1 tag and no CI publish pipeline yet.
+  dependency-transparency: done
   docs-actions:
     status: exempt
     comment: Integration does not register custom actions.
