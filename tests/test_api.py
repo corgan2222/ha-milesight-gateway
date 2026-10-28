@@ -219,3 +219,52 @@ async def test_a_gateway_that_never_had_devices_stays_empty_without_error():
 
     assert devices == []
     assert (online, offline) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("raw_total", "expected_devices"),
+    [
+        # The real gateway sends devTotalCount as a string, which used to be
+        # compared against a length and raised TypeError.
+        ("1", 1),
+        (1, 1),
+        ("", 1),
+        (None, 1),
+        ("not a number", 1),
+    ],
+)
+async def test_device_count_is_normalised(raw_total, expected_devices):
+    """A non-integer device count must not break the device fetch."""
+    client = MagicMock()
+    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
+    client.get_all_devices = AsyncMock(
+        return_value=(
+            [{"devEUI": "24e124725e123456", "active": True}],
+            raw_total,
+        )
+    )
+    api = _api(client)
+    await api.async_connect(MagicMock())
+
+    devices, online, offline = await api.async_get_devices(MagicMock())
+
+    assert online == expected_devices
+    assert offline == 0
+    assert isinstance(devices, list)
+
+
+async def test_string_device_count_still_detects_truncation():
+    """Normalising the count must not lose the truncation check."""
+    client = MagicMock()
+    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
+    client.get_all_devices = AsyncMock(
+        return_value=(
+            [{"devEUI": f"eui{i}", "active": True} for i in range(10)],
+            "25",
+        )
+    )
+    api = _api(client)
+    await api.async_connect(MagicMock())
+
+    with pytest.raises(APIConnectionError, match="10 of 25"):
+        await api.async_get_devices(MagicMock())
