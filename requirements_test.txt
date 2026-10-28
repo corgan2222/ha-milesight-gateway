@@ -5,4 +5,4 @@ pytest-homeassistant-custom-component==0.13.366
 # The integration's own runtime dependency. The test suite imports
 # custom_components.milesight_gateway.api, which imports the client, so
 # collection fails without it. Kept in sync with manifest.json.
-Milesight-Gateway-API==0.0.1
+Milesight-Gateway-API==0.0.2

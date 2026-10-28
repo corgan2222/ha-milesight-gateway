@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import pathlib
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,8 @@ from aiohttp import ClientError, ClientResponseError, ContentTypeError
 from milesight_gateway_api.milesight_gateway_client import MilesightGatewayClient
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from aiohttp import ClientSession
 
 _LOGGER = logging.getLogger(__name__)
@@ -310,6 +313,45 @@ class APIConnectionError(Exception):
     """Raised when the gateway cannot be reached."""
 
 
+@contextmanager
+def _as_api_error() -> Iterator[None]:
+    """Translate the client's exceptions into this integration's two types."""
+    try:
+        yield
+    except ContentTypeError as err:
+        # Subclasses ClientResponseError, so it must be caught first; its
+        # .status is the real status (usually 200), not an auth code.
+        msg = "Gateway returned a non-JSON response"
+        raise APIConnectionError(msg) from err
+    except ClientResponseError as err:
+        if err.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            msg = f"Gateway rejected the credentials (HTTP {err.status})"
+            raise APIAuthError(msg) from err
+        msg = f"Gateway returned HTTP {err.status}"
+        raise APIConnectionError(msg) from err
+    except ClientError as err:
+        msg = f"Cannot reach gateway: {err}"
+        raise APIConnectionError(msg) from err
+    except TimeoutError as err:
+        # Not an aiohttp.ClientError, so it needs its own clause.
+        msg = "Timeout talking to gateway"
+        raise APIConnectionError(msg) from err
+    except json.JSONDecodeError as err:
+        # Before ValueError below — JSONDecodeError is a ValueError.
+        msg = "Malformed response from gateway"
+        raise APIConnectionError(msg) from err
+    except ValueError as err:
+        # The client builds its AES cipher before any request, so a
+        # wrong-length secret key or IV fails here, not over the network.
+        msg = f"Invalid secret key or IV: {err}"
+        raise APIAuthError(msg) from err
+    except (AttributeError, TypeError) as err:
+        # The client calls .get() on the decoded body, so a JSON response
+        # that is not an object (null, a list, a bare string) fails there.
+        msg = "Unexpected response from gateway"
+        raise APIConnectionError(msg) from err
+
+
 class MilesightGatewayAPI:
     """Wraps MilesightGatewayClient with HA-friendly async methods."""
 
@@ -326,7 +368,6 @@ class MilesightGatewayAPI:
     ) -> None:
         """Initialize."""
         self.connected: bool = False
-        self._devices_seen: bool = False
         self._mqtt_base_topic = mqtt_base_topic
         self._devices_db: dict = {}
         self._client = MilesightGatewayClient(
@@ -342,40 +383,9 @@ class MilesightGatewayAPI:
         """Authenticate and obtain a JWT token from the gateway."""
         self._devices_db = await asyncio.to_thread(_load_devices_db)
         self.connected = False
-        try:
+
+        with _as_api_error():
             token = await self._client.get_jwt_token(session)
-        except ContentTypeError as err:
-            # Subclasses ClientResponseError, so it must be caught first; its
-            # .status is the real status (usually 200), not an auth code.
-            msg = "Gateway returned a non-JSON login response"
-            raise APIConnectionError(msg) from err
-        except ClientResponseError as err:
-            if err.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
-                msg = f"Invalid gateway credentials (HTTP {err.status})"
-                raise APIAuthError(msg) from err
-            msg = f"Gateway returned HTTP {err.status}"
-            raise APIConnectionError(msg) from err
-        except ClientError as err:
-            msg = f"Cannot reach gateway: {err}"
-            raise APIConnectionError(msg) from err
-        except TimeoutError as err:
-            # Not an aiohttp.ClientError, so it needs its own clause.
-            msg = "Timeout connecting to gateway"
-            raise APIConnectionError(msg) from err
-        except json.JSONDecodeError as err:
-            # Before ValueError below — JSONDecodeError is a ValueError.
-            msg = "Malformed login response from gateway"
-            raise APIConnectionError(msg) from err
-        except ValueError as err:
-            # The client builds its AES cipher before any request, so a
-            # wrong-length secret key or IV fails here, not over the network.
-            msg = f"Invalid secret key or IV: {err}"
-            raise APIAuthError(msg) from err
-        except (AttributeError, TypeError) as err:
-            # The client calls .get() on the decoded body, so a JSON response
-            # that is not an object (null, a list, a bare string) fails there.
-            msg = "Unexpected login response from gateway"
-            raise APIConnectionError(msg) from err
 
         if not token:
             # The client returns None instead of raising when the gateway
@@ -386,58 +396,23 @@ class MilesightGatewayAPI:
         self.connected = True
         return True
 
-    async def _fetch_devices(self, session: ClientSession) -> tuple[list[dict], int]:
-        """
-        Fetch the raw device list with a usable device count.
-
-        The gateway reports devTotalCount as a string and the client passes the
-        JSON value through untouched, so it has to be normalised before it can
-        be compared with a length.
-        """
-        all_devices, raw_total = await self._client.get_all_devices(session)
-        try:
-            total_count = int(raw_total)
-        except TypeError, ValueError:
-            _LOGGER.debug("Gateway sent an unusable device count: %r", raw_total)
-            total_count = 0
-        return all_devices, total_count
+    async def _fetch_devices(self, session: ClientSession) -> list[dict]:
+        """Fetch the raw device list, translating any failure."""
+        with _as_api_error():
+            all_devices, _ = await self._client.get_all_devices(session)
+        return all_devices
 
     async def async_get_devices(
         self, session: ClientSession
     ) -> tuple[list[MilesightDevice], int, int]:
         """Fetch devices; return (active_list, online_count, offline_count)."""
-        all_devices, total_count = await self._fetch_devices(session)
-
-        if not all_devices and not total_count:
-            # get_all_devices logs and breaks out of its pagination loop on any
-            # error, so ([], 0) means either "no devices" or "the call failed",
-            # and the return value cannot tell them apart. Re-authenticating
-            # catches the subset where the token is the problem, and recovers
-            # from an expired one.
+        try:
+            all_devices = await self._fetch_devices(session)
+        except APIAuthError:
+            # A JWT that expired mid-session looks the same as a bad password,
+            # so log in once more before reporting the credentials as wrong.
             await self.async_connect(session)
-            all_devices, total_count = await self._fetch_devices(session)
-
-        if not all_devices and not total_count and self._devices_seen:
-            # This gateway has reported devices before, so an empty list now is
-            # a failure the client swallowed, not an empty gateway.
-            msg = "Gateway stopped returning its device list"
-            raise APIConnectionError(msg)
-
-        if total_count and len(all_devices) < total_count:
-            # A successful run always collects every page, so a short list means
-            # the client broke out of its pagination loop partway through.
-            msg = f"Gateway returned {len(all_devices)} of {total_count} devices"
-            raise APIConnectionError(msg)
-
-        if all_devices:
-            self._devices_seen = True
-        elif not self._devices_seen:
-            # Indistinguishable from a swallowed failure on a fresh setup, so
-            # leave a trace rather than reporting a healthy empty gateway.
-            _LOGGER.warning(
-                "Gateway returned no devices; if devices are paired, check that "
-                "the account may read the device list"
-            )
+            all_devices = await self._fetch_devices(session)
 
         result: list[MilesightDevice] = []
         online_count = 0
