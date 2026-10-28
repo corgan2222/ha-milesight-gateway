@@ -1,9 +1,9 @@
 """Tests for the API wrapper's error translation.
 
-``MilesightGatewayClient`` reports failures in two awkward ways: it re-raises
-raw aiohttp exceptions from ``get_jwt_token``, and it swallows everything in
-``get_all_devices`` and returns ``([], 0)`` instead. Both are translated here,
-and these tests pin that translation down.
+Since Milesight-Gateway-API 0.0.2 the client raises instead of swallowing its
+own errors, so the wrapper's job is to translate those into the two types the
+config flow and the coordinator act on, and to retry a login once when a token
+has merely expired.
 """
 
 from __future__ import annotations
@@ -53,26 +53,41 @@ def _api(client: MagicMock) -> MilesightGatewayAPI:
         )
 
 
-@pytest.mark.parametrize(
-    ("raised", "expected"),
-    [
-        # 401/403 are credentials; every other HTTP status is a reachability
-        # problem, not a wrong password.
-        (_response_error(401), APIAuthError),
-        (_response_error(403), APIAuthError),
-        (_response_error(500), APIConnectionError),
-        (_response_error(404), APIConnectionError),
-        # ContentTypeError subclasses ClientResponseError and carries the real
-        # status (200 here), so it must not be read as an auth code.
-        (_content_type_error(), APIConnectionError),
-        (ClientConnectionError("host down"), APIConnectionError),
-        (TimeoutError(), APIConnectionError),
-        (json.JSONDecodeError("bad", "{}", 0), APIConnectionError),
-        # The client builds its AES cipher before any request, so a bad key
-        # length surfaces as a plain ValueError.
-        (ValueError("Incorrect AES key length"), APIAuthError),
-    ],
-)
+def _ok_client(devices: list[dict] | None = None) -> MagicMock:
+    """A client that logs in and returns the given raw device list."""
+    client = MagicMock()
+    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
+    client.get_all_devices = AsyncMock(return_value=(devices or [], len(devices or [])))
+    return client
+
+
+# Everything the client can throw, and the type it must arrive as.
+TRANSLATIONS = [
+    # 401 and 403 are credentials; any other HTTP status is a reachability
+    # problem, not a wrong password.
+    (_response_error(401), APIAuthError),
+    (_response_error(403), APIAuthError),
+    (_response_error(500), APIConnectionError),
+    (_response_error(404), APIConnectionError),
+    # ContentTypeError subclasses ClientResponseError and carries the real
+    # status (200 here), so it must not be read as an auth code.
+    (_content_type_error(), APIConnectionError),
+    (ClientConnectionError("host down"), APIConnectionError),
+    (TimeoutError(), APIConnectionError),
+    (json.JSONDecodeError("bad", "{}", 0), APIConnectionError),
+    # The client builds its AES cipher before any request, so a bad key
+    # length surfaces as a plain ValueError.
+    (ValueError("Incorrect AES key length"), APIAuthError),
+    # The client calls .get() on the decoded body, so a JSON response that is
+    # not an object fails with AttributeError inside the client.
+    (AttributeError("'list' object has no attribute 'get'"), APIConnectionError),
+]
+
+
+# --- connect ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("raised", "expected"), TRANSLATIONS)
 async def test_connect_translates_client_errors(raised, expected):
     """Everything the client can raise becomes one of our two error types."""
     client = MagicMock()
@@ -99,55 +114,64 @@ async def test_connect_rejects_a_missing_token():
 
 async def test_connect_succeeds_with_a_token():
     """A token marks the API connected."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    api = _api(client)
+    api = _api(_ok_client())
 
     assert await api.async_connect(MagicMock()) is True
     assert api.connected is True
 
 
-async def test_empty_device_list_triggers_one_reauth_attempt():
-    """An empty result is ambiguous, so it is retried behind a fresh login."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(side_effect=[([], 0), ([], 0)])
+# --- fetching devices ------------------------------------------------------
+
+
+@pytest.mark.parametrize(("raised", "expected"), TRANSLATIONS)
+async def test_device_fetch_translates_client_errors(raised, expected):
+    """The device call gets the same translation as the login."""
+    client = _ok_client()
+    api = _api(client)
+    await api.async_connect(MagicMock())
+    # The retry path logs in again, so keep that failing the same way.
+    client.get_jwt_token = AsyncMock(side_effect=raised)
+    client.get_all_devices = AsyncMock(side_effect=raised)
+
+    with pytest.raises(expected):
+        await api.async_get_devices(MagicMock())
+
+
+async def test_expired_token_is_retried_behind_a_fresh_login():
+    """A 401 while fetching means the token expired, not a wrong password."""
+    devices = [{"devEUI": "24e124725e123456", "active": True}]
+    client = _ok_client()
     api = _api(client)
     await api.async_connect(MagicMock())
     client.get_jwt_token.reset_mock()
 
-    devices, online, offline = await api.async_get_devices(MagicMock())
+    client.get_all_devices = AsyncMock(side_effect=[_response_error(401), (devices, 1)])
 
-    # A gateway with genuinely no devices reports zero without raising.
-    assert devices == []
-    assert (online, offline) == (0, 0)
+    found, online, offline = await api.async_get_devices(MagicMock())
+
+    assert len(found) == 1
+    assert (online, offline) == (1, 0)
     assert client.get_jwt_token.await_count == 1
     assert client.get_all_devices.await_count == 2
 
 
-async def test_empty_device_list_surfaces_the_real_error():
-    """If the re-login fails, the swallowed failure finally becomes visible."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(return_value=([], 0))
+async def test_credentials_that_stay_rejected_surface_as_an_auth_error():
+    """If the retry is rejected too, the credentials really are wrong."""
+    client = _ok_client()
     api = _api(client)
     await api.async_connect(MagicMock())
 
-    client.get_jwt_token = AsyncMock(side_effect=_response_error(401))
+    client.get_all_devices = AsyncMock(side_effect=_response_error(401))
 
     with pytest.raises(APIAuthError):
         await api.async_get_devices(MagicMock())
 
-    assert api.connected is False
+    assert client.get_all_devices.await_count == 2
 
 
-async def test_non_empty_device_list_does_not_reauth():
-    """The happy path costs exactly one request and no extra login."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(
-        return_value=([{"devEUI": "24e124725e123456", "active": False}], 1)
-    )
+async def test_a_gateway_with_no_devices_is_not_an_error():
+    """An empty list is now unambiguous: the gateway really has nothing."""
+    client = _ok_client([])
     api = _api(client)
     await api.async_connect(MagicMock())
     client.get_jwt_token.reset_mock()
@@ -155,116 +179,24 @@ async def test_non_empty_device_list_does_not_reauth():
     devices, online, offline = await api.async_get_devices(MagicMock())
 
     assert devices == []
-    assert (online, offline) == (0, 1)
+    assert (online, offline) == (0, 0)
+    # Nothing to guess at any more, so no second login.
     assert client.get_jwt_token.await_count == 0
     assert client.get_all_devices.await_count == 1
 
 
-async def test_connect_translates_a_non_object_json_body():
-    """A 200 response whose body is not an object fails inside the client."""
-    client = MagicMock()
-    # The client does data.get("jwt") on the decoded body, so a list raises
-    # AttributeError rather than any aiohttp or value error.
-    client.get_jwt_token = AsyncMock(
-        side_effect=AttributeError("'list' object has no attribute 'get'")
+async def test_offline_devices_are_counted_but_not_returned():
+    """Only active devices become entities; the rest are counted as offline."""
+    client = _ok_client(
+        [
+            {"devEUI": "24e124725e123456", "active": False},
+            {"devEUI": "24e124725e654321", "active": False},
+        ]
     )
-    api = _api(client)
-
-    with pytest.raises(APIConnectionError):
-        await api.async_connect(MagicMock())
-
-
-async def test_truncated_pagination_is_an_error():
-    """A short device list means the client aborted its pagination loop."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    # 10 devices collected, 25 reported: pages 2+ were lost to a swallowed error.
-    client.get_all_devices = AsyncMock(
-        return_value=([{"devEUI": f"eui{i}", "active": True} for i in range(10)], 25)
-    )
-    api = _api(client)
-    await api.async_connect(MagicMock())
-
-    with pytest.raises(APIConnectionError, match="10 of 25"):
-        await api.async_get_devices(MagicMock())
-
-
-async def test_a_gateway_that_had_devices_and_now_reports_none_is_an_error():
-    """Going from devices to an empty list is a failure, not an empty gateway."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(
-        return_value=([{"devEUI": "24e124725e123456", "active": True}], 1)
-    )
-    api = _api(client)
-    await api.async_connect(MagicMock())
-    # First poll sees a device, so the gateway is known to have some.
-    await api.async_get_devices(MagicMock())
-
-    client.get_all_devices = AsyncMock(return_value=([], 0))
-
-    with pytest.raises(APIConnectionError, match="stopped returning"):
-        await api.async_get_devices(MagicMock())
-
-
-async def test_a_gateway_that_never_had_devices_stays_empty_without_error():
-    """A genuinely empty gateway must still set up, with a warning logged."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(return_value=([], 0))
     api = _api(client)
     await api.async_connect(MagicMock())
 
     devices, online, offline = await api.async_get_devices(MagicMock())
 
     assert devices == []
-    assert (online, offline) == (0, 0)
-
-
-@pytest.mark.parametrize(
-    ("raw_total", "expected_devices"),
-    [
-        # The real gateway sends devTotalCount as a string, which used to be
-        # compared against a length and raised TypeError.
-        ("1", 1),
-        (1, 1),
-        ("", 1),
-        (None, 1),
-        ("not a number", 1),
-    ],
-)
-async def test_device_count_is_normalised(raw_total, expected_devices):
-    """A non-integer device count must not break the device fetch."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(
-        return_value=(
-            [{"devEUI": "24e124725e123456", "active": True}],
-            raw_total,
-        )
-    )
-    api = _api(client)
-    await api.async_connect(MagicMock())
-
-    devices, online, offline = await api.async_get_devices(MagicMock())
-
-    assert online == expected_devices
-    assert offline == 0
-    assert isinstance(devices, list)
-
-
-async def test_string_device_count_still_detects_truncation():
-    """Normalising the count must not lose the truncation check."""
-    client = MagicMock()
-    client.get_jwt_token = AsyncMock(return_value="a.jwt.token")
-    client.get_all_devices = AsyncMock(
-        return_value=(
-            [{"devEUI": f"eui{i}", "active": True} for i in range(10)],
-            "25",
-        )
-    )
-    api = _api(client)
-    await api.async_connect(MagicMock())
-
-    with pytest.raises(APIConnectionError, match="10 of 25"):
-        await api.async_get_devices(MagicMock())
+    assert (online, offline) == (0, 2)
