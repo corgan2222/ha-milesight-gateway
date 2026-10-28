@@ -1,5 +1,5 @@
 colorlog==6.12.0
-homeassistant==2026.6.4
+homeassistant==2026.9.3
 pip>=26.2.1
-ruff==0.15.20
+ruff==0.16.9
 Milesight-Gateway-API==0.0.1

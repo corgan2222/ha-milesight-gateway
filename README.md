@@ -29,7 +29,7 @@ Device entity definitions are matched from a built-in database of 130+ Milesight
 
 ## Requirements
 
-- Home Assistant 2026.6.0 or newer
+- Home Assistant 2026.9.0 or newer
 - A running [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) in Home Assistant
 - A Milesight LoRaWAN gateway reachable from your Home Assistant instance
 - Gateway credentials (username & password)
