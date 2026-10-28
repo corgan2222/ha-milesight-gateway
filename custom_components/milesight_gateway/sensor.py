@@ -76,7 +76,8 @@ async def async_setup_entry(
     coordinator: MilesightGatewayCoordinator = config_entry.runtime_data.coordinator
     gateway_url = config_entry.data[CONF_GATEWAY_URL]
     port = config_entry.data[CONF_PORT]
-    gateway_id = f"{gateway_url}:{port}"
+    # Keyed on the entry id, not the address, so the device survives an IP change.
+    gateway_id = config_entry.entry_id
     gateway_host = urlparse(gateway_url).hostname or gateway_url
 
     gateway_device_info = DeviceInfo(identifiers={(DOMAIN, gateway_id)})

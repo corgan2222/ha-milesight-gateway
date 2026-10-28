@@ -23,6 +23,11 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
+# Bumped when entry data or the registry layout changes; see
+# async_migrate_entry and ConfigFlow.MINOR_VERSION.
+ENTRY_VERSION = 1
+ENTRY_MINOR_VERSION = 2
+
 type MilesightGatewayConfigEntry = ConfigEntry[RuntimeData]
 
 
@@ -31,6 +36,30 @@ class RuntimeData:
     """Runtime data stored on the config entry."""
 
     coordinator: DataUpdateCoordinator
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: MilesightGatewayConfigEntry
+) -> bool:
+    """
+    Migrate the gateway device off its address-derived identifier.
+
+    Runs before setup, while entry.data still holds the address the existing
+    device was registered under, so it must ship with the change that makes the
+    address editable — not after it.
+    """
+    if entry.version == ENTRY_VERSION and entry.minor_version < ENTRY_MINOR_VERSION:
+        device_registry = dr.async_get(hass)
+        legacy_id = f"{entry.data[CONF_GATEWAY_URL]}:{entry.data[CONF_PORT]}"
+        if device := device_registry.async_get_device(
+            identifiers={(DOMAIN, legacy_id)}
+        ):
+            device_registry.async_update_device(
+                device.id, new_identifiers={(DOMAIN, entry.entry_id)}
+            )
+        hass.config_entries.async_update_entry(entry, minor_version=ENTRY_MINOR_VERSION)
+
+    return True
 
 
 async def async_setup_entry(
@@ -45,34 +74,24 @@ async def async_setup_entry(
         raise ConfigEntryNotReady
 
     # Register the gateway as a device so sensor devices can link to it
-    # via via_device.
+    # via via_device. Identified by the entry id rather than the address, so
+    # changing the gateway's URL does not create a second device.
     gateway_url = entry.data[CONF_GATEWAY_URL]
-    port = entry.data[CONF_PORT]
-    gateway_id = f"{gateway_url}:{port}"
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, gateway_id)},
-        name=f"Milesight Gateway ({gateway_url})",
+        identifiers={(DOMAIN, entry.entry_id)},
+        name="Milesight Gateway",
         manufacturer="Milesight",
         model="LoRaWAN Gateway",
         configuration_url=gateway_url,
     )
-
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     entry.runtime_data = RuntimeData(coordinator)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
-
-
-async def _async_update_listener(
-    hass: HomeAssistant, entry: MilesightGatewayConfigEntry
-) -> None:
-    """Reload the integration when config options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_remove_config_entry_device(
