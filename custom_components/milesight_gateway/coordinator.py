@@ -18,6 +18,7 @@ from homeassistant.const import (
     CONF_SCAN_INTERVAL,
     CONF_USERNAME,
 )
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -85,7 +86,7 @@ class MilesightGatewayCoordinator(DataUpdateCoordinator[MilesightGatewayData]):
             )
         except APIAuthError as err:
             msg = f"Authentication failed: {err}"
-            raise UpdateFailed(msg) from err
+            raise ConfigEntryAuthFailed(msg) from err
         except APIConnectionError as err:
             msg = f"Cannot reach gateway: {err}"
             raise UpdateFailed(msg) from err

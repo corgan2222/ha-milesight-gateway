@@ -2,7 +2,8 @@
   "config": {
     "abort": {
       "already_configured": "Gerät ist bereits konfiguriert",
-      "reconfigure_successful": "Neukonfiguration war erfolgreich"
+      "reconfigure_successful": "Neukonfiguration war erfolgreich",
+      "reauth_successful": "Neue Anmeldung war erfolgreich"
     },
     "error": {
       "cannot_connect": "Verbindung fehlgeschlagen",
@@ -32,10 +33,28 @@
           "gateway_mqtt_base_topic": "Das MQTT-Topic-Präfix für Sensor-Uplink-Nachrichten, zum Beispiel `sensors/lora/uplink`."
         }
       },
+      "reauth_confirm": {
+        "title": "Neu am Milesight-Gateway anmelden",
+        "description": "Das Gateway hat die gespeicherten Zugangsdaten abgelehnt. Gib die aktuellen ein.",
+        "data": {
+          "username": "Benutzername",
+          "password": "Passwort",
+          "secret_key": "Geheimschlüssel",
+          "iv": "Initialisierungsvektor (IV)"
+        },
+        "data_description": {
+          "username": "Der Benutzername für die Anmeldung am Milesight-Gateway.",
+          "password": "Das aktuelle Passwort für die Anmeldung am Milesight-Gateway.",
+          "secret_key": "Der 16-stellige AES-Schlüssel für das Gateway-Passwort.",
+          "iv": "Der 16-stellige AES-Initialisierungsvektor für das Gateway-Passwort."
+        }
+      },
       "reconfigure": {
         "title": "Milesight Gateway neu konfigurieren",
-        "description": "Aktualisieren Sie die Anmeldedaten für Ihr Milesight Gateway.",
+        "description": "Adresse und Zugangsdaten deines Milesight-Gateways ändern. Lass das Passwort leer, um das gespeicherte zu behalten.",
         "data": {
+          "gateway_url": "Gateway-URL",
+          "port": "Port",
           "username": "Benutzername",
           "password": "Passwort",
           "secret_key": "Geheimschlüssel",
@@ -43,6 +62,8 @@
           "gateway_mqtt_base_topic": "MQTT-Uplink-Basistopic"
         },
         "data_description": {
+          "gateway_url": "Die URL deines Milesight-Gateways, zum Beispiel `https://192.168.2.180`. Hier ändern, wenn das Gateway eine andere Adresse bekommen hat.",
+          "port": "Der Port der Gateway-API.",
           "username": "Der Benutzername für die Anmeldung am Milesight Gateway.",
           "password": "Das neue Passwort für die Anmeldung am Milesight Gateway.",
           "secret_key": "Der 16-stellige AES-Verschlüsselungsschlüssel für das Gateway-Passwort.",

@@ -4,43 +4,42 @@ rules:
     status: exempt
     comment: Integration does not register custom actions.
   appropriate-polling:
+    status: done
+    comment: >-
+      The coordinator polls the device list every 300 s by default, which
+      suits how rarely it changes; sensor states arrive by MQTT push. The
+      options flow exposes the interval for large fleets, minimum 60 s.
+  brands:
     status: exempt
-    comment: Integration has no polling entities yet.
-  brands: done
+    comment: >-
+      Custom integration: ships local brand images under brand/ as
+      documented for custom integrations, which is what the HACS brands
+      check validates. No home-assistant/brands pull request exists.
   common-modules:
     status: exempt
-    comment: No coordinator or base entity class needed yet.
+    comment: >-
+      The coordinator lives in coordinator.py. There is no base entity
+      class shared across platforms, so entity.py would hold nothing but a
+      DeviceInfo helper.
   config-flow-test-coverage: done
   config-flow: done
-  dependency-transparency: done
+  dependency-transparency:
+    status: todo
+    comment: >-
+      Milesight-Gateway-API is on PyPI under MIT with public source, but the
+      upstream repository has no 0.0.1 tag and no CI publish pipeline yet.
   docs-actions:
     status: exempt
     comment: Integration does not register custom actions.
-  docs-high-level-description:
-    status: exempt
-    comment: Documentation will be added before the integration is published.
-  docs-installation-instructions:
-    status: exempt
-    comment: Documentation will be added before the integration is published.
-  docs-removal-instructions:
-    status: exempt
-    comment: Documentation will be added before the integration is published.
-  entity-event-setup:
-    status: exempt
-    comment: Integration has no entities yet.
-  entity-unique-id:
-    status: exempt
-    comment: Integration has no entities yet.
-  has-entity-name:
-    status: exempt
-    comment: Integration has no entities yet.
-  runtime-data:
-    status: exempt
-    comment: Integration has no runtime data yet (no client instantiated).
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  entity-event-setup: done
+  entity-unique-id: done
+  has-entity-name: done
+  runtime-data: done
   test-before-configure: done
-  test-before-setup:
-    status: exempt
-    comment: Integration has no real API setup yet.
+  test-before-setup: done
   unique-config-entry: done
 
   # Silver
@@ -48,45 +47,43 @@ rules:
     status: exempt
     comment: Integration does not register custom actions.
   config-entry-unloading: done
-  docs-configuration-parameters: todo
-  docs-installation-parameters: todo
+  docs-configuration-parameters: done
+  docs-installation-parameters: done
   entity-unavailable:
-    status: exempt
-    comment: Integration has no entities yet.
+    status: todo
+    comment: >-
+      The gateway diagnostic sensors inherit availability from the coordinator,
+      but the MQTT-driven device entities have no availability handling yet.
   integration-owner: done
-  log-when-unavailable:
-    status: exempt
-    comment: Integration has no entities yet.
-  parallel-updates:
-    status: exempt
-    comment: Integration has no platforms yet.
-  reauthentication-flow: todo
+  log-when-unavailable: done
+  parallel-updates: done
+  reauthentication-flow: done
   test-coverage: todo
 
   # Gold
-  devices: todo
+  devices: done
   diagnostics: todo
   discovery-update-info: todo
   discovery: todo
-  docs-data-update: todo
+  docs-data-update: done
   docs-examples: todo
-  docs-known-limitations: todo
-  docs-supported-devices: todo
-  docs-supported-functions: todo
-  docs-troubleshooting: todo
+  docs-known-limitations: done
+  docs-supported-devices: done
+  docs-supported-functions: done
+  docs-troubleshooting: done
   docs-use-cases: todo
   dynamic-devices: todo
-  entity-category: todo
-  entity-device-class: todo
-  entity-disabled-by-default: todo
+  entity-category: done
+  entity-device-class: done
+  entity-disabled-by-default: done
   entity-translations: todo
   exception-translations: todo
   icon-translations: todo
-  reconfiguration-flow: todo
+  reconfiguration-flow: done
   repair-issues: todo
   stale-devices: todo
 
   # Platinum
-  async-dependency: todo
-  inject-websession: todo
+  async-dependency: done
+  inject-websession: done
   strict-typing: todo

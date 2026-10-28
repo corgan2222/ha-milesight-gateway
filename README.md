@@ -5,7 +5,7 @@
 
 # Milesight Gateway — Home Assistant Integration
 
-[![GitHub Repository](https://img.shields.io/badge/GitHub-corgan2222%2Fha-milesight-gateway-blue?logo=github)](https://github.com/corgan2222/ha-milesight-gateway)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-corgan2222%2Fha--milesight--gateway-blue?logo=github)](https://github.com/corgan2222/ha-milesight-gateway)
 
 
 A custom Home Assistant integration that bridges **Milesight LoRaWAN gateways** with Home Assistant, providing real-time sensor data from 130+ Milesight LoRaWAN devices.
@@ -29,7 +29,7 @@ Device entity definitions are matched from a built-in database of 130+ Milesight
 
 ## Requirements
 
-- Home Assistant 2026.3.2 or newer
+- Home Assistant 2026.9.0 or newer
 - A running [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) in Home Assistant
 - A Milesight LoRaWAN gateway reachable from your Home Assistant instance
 - Gateway credentials (username & password)
@@ -41,7 +41,7 @@ Device entity definitions are matched from a built-in database of 130+ Milesight
 
 ## Installation
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=corgan2222&repository=milesight_gateway&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=corgan2222&repository=ha-milesight-gateway&category=integration)
 
 then 
 
@@ -81,7 +81,7 @@ Go to **Settings → Devices & Services → Add Integration** and search for **M
 | **IV**                     | 16-character AES initialization vector (from gateway security settings) | `2222222222222222`  |
 | **MQTT Uplink Base Topic** | Base MQTT topic where the gateway publishes device data               | `sensors/lora/uplink` |
 
-> The gateway URL and port cannot be changed after setup to preserve existing device associations. Use **Reconfigure** to update credentials, Secret Key, IV, or MQTT topic at any time.
+> Use **Reconfigure** to change the gateway URL, port, credentials, Secret Key, IV, or MQTT topic at any time — existing devices and entities are kept. Leave the password field empty to keep the stored password.
 
 ### Options
 
@@ -232,9 +232,25 @@ The enriched payload enables all diagnostic entities (RSSI, SNR, Last Seen, devi
 - Only active/online devices are imported. Offline devices are skipped.
 - If a device model is not in the built-in database, it will be silently skipped. Enable debug logging for `custom_components.milesight_gateway` to see which devices were not matched.
 
-### Updating credentials
+### Updating the connection
 
-- Use **Settings → Devices & Services → Milesight Gateway → Reconfigure** to update your username, password, Secret Key, IV, or MQTT topic without removing the integration.
+- Use **Settings → Devices & Services → Milesight Gateway → Reconfigure** to change the gateway URL, port, username, password, Secret Key, IV, or MQTT topic without removing the integration. Your devices, entities and their history are kept.
+- If the gateway moved to a different IP address, this is the place to correct it — the entry will reconnect after the reload.
+
+---
+
+## Removal
+
+1. Go to **Settings → Devices & Services → Milesight Gateway**.
+2. Open the **⋮** menu on the integration entry and choose **Delete**.
+
+This removes the config entry together with every device and entity it created.
+No settings are left behind on the gateway itself, and the gateway keeps
+publishing to MQTT — stop that in the gateway's own configuration if you no
+longer want the uplinks.
+
+If you installed through HACS and want the files gone as well, open **HACS →
+Milesight Gateway → ⋮ → Remove** afterwards and restart Home Assistant.
 
 ---
 
