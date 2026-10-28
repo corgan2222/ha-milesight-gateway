@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.mqtt import async_subscribe
-from homeassistant.const import CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
@@ -44,8 +43,8 @@ async def async_setup_entry(
     """Create binary sensor entities for all binary_sensor-platform entities."""
     coordinator = config_entry.runtime_data.coordinator
     gateway_url = config_entry.data[CONF_GATEWAY_URL]
-    port = config_entry.data[CONF_PORT]
-    gateway_id = f"{gateway_url}:{port}"
+    # Keyed on the entry id, not the address, so the device survives an IP change.
+    gateway_id = config_entry.entry_id
     configuration_url = gateway_url
 
     entities = [
