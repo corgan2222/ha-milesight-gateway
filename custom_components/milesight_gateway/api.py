@@ -315,6 +315,7 @@ class MilesightGatewayAPI:
 
     def __init__(  # noqa: PLR0913
         self,
+        *,
         gateway_url: str,
         port: str | int,
         username: str,

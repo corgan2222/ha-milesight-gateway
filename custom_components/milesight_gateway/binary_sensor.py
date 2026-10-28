@@ -44,7 +44,7 @@ async def async_setup_entry(
     coordinator = config_entry.runtime_data.coordinator
     gateway_url = config_entry.data[CONF_GATEWAY_URL]
     # Keyed on the entry id, not the address, so the device survives an IP change.
-    gateway_id = config_entry.entry_id
+    gateway_id = config_entry.runtime_data.gateway_device_id
     configuration_url = gateway_url
 
     entities = [
@@ -96,7 +96,7 @@ class MilesightBinarySensor(BinarySensorEntity):
             model_id=device.model_id or None,
             serial_number=device.dev_eui,
             configuration_url=configuration_url,
-            via_device=(DOMAIN, gateway_id),
+            via_device_id=gateway_id,
         )
 
     async def async_added_to_hass(self) -> None:

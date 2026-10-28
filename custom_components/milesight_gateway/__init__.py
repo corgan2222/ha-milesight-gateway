@@ -36,6 +36,7 @@ class RuntimeData:
     """Runtime data stored on the config entry."""
 
     coordinator: DataUpdateCoordinator
+    gateway_device_id: str
 
 
 async def async_migrate_entry(
@@ -51,8 +52,8 @@ async def async_migrate_entry(
     if entry.version == ENTRY_VERSION and entry.minor_version < ENTRY_MINOR_VERSION:
         device_registry = dr.async_get(hass)
         legacy_id = f"{entry.data[CONF_GATEWAY_URL]}:{entry.data[CONF_PORT]}"
-        if device := device_registry.async_get_device(
-            identifiers={(DOMAIN, legacy_id)}
+        if device := device_registry.async_get_device_by_identifier(
+            (DOMAIN, legacy_id), entry.entry_id
         ):
             device_registry.async_update_device(
                 device.id, new_identifiers={(DOMAIN, entry.entry_id)}
@@ -74,11 +75,11 @@ async def async_setup_entry(
         raise ConfigEntryNotReady
 
     # Register the gateway as a device so sensor devices can link to it
-    # via via_device. Identified by the entry id rather than the address, so
+    # via via_device_id. Identified by the entry id rather than the address, so
     # changing the gateway's URL does not create a second device.
     gateway_url = entry.data[CONF_GATEWAY_URL]
     device_registry = dr.async_get(hass)
-    device_registry.async_get_or_create(
+    gateway_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
         name="Milesight Gateway",
@@ -87,7 +88,7 @@ async def async_setup_entry(
         configuration_url=gateway_url,
     )
 
-    entry.runtime_data = RuntimeData(coordinator)
+    entry.runtime_data = RuntimeData(coordinator, gateway_device.id)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 

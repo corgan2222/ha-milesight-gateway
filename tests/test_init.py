@@ -3,7 +3,7 @@
 The migration rewrites the gateway device's registry identifier, which is the
 riskiest part of making the gateway address editable: get it wrong on an
 existing install and the gateway device is duplicated and its child devices
-lose their ``via_device`` link.
+lose their ``via_device_id`` link.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ async def test_migration_moves_the_gateway_device_to_the_entry_id(hass):
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, "24e124725e123456")},
         name="AM307",
-        via_device=(DOMAIN, LEGACY_ID),
+        via_device_id=gateway.id,
     )
 
     assert await async_migrate_entry(hass, entry)
@@ -72,7 +72,10 @@ async def test_migration_moves_the_gateway_device_to_the_entry_id(hass):
     assert migrated is not None
     # Same row, new identifier — not a second device.
     assert migrated.identifiers == {(DOMAIN, entry.entry_id)}
-    assert registry.async_get_device(identifiers={(DOMAIN, LEGACY_ID)}) is None
+    assert (
+        registry.async_get_device_by_identifier((DOMAIN, LEGACY_ID), entry.entry_id)
+        is None
+    )
     assert entry.minor_version == ENTRY_MINOR_VERSION
 
     # The child keeps pointing at the same gateway row.
