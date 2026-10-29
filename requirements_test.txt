@@ -1,7 +1,7 @@
 # Test dependencies. pytest-homeassistant-custom-component pulls a matching
 # Home Assistant plus pytest, pytest-cov and pytest-asyncio transitively.
 # Pinned to the release that matches homeassistant==2026.9.3 (see requirements.txt).
-pytest-homeassistant-custom-component==0.13.366
+pytest-homeassistant-custom-component==0.13.375
 # The integration's own runtime dependency. The test suite imports
 # custom_components.milesight_gateway.api, which imports the client, so
 # collection fails without it. Kept in sync with manifest.json.
