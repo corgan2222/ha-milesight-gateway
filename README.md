@@ -113,25 +113,27 @@ For each discovered LoRaWAN device, entities are created based on the device mod
 
 #### Measurement Sensors (`sensor` platform)
 
-| Key           | Description                    | Unit  | Device Class              |
-| ------------- | ------------------------------ | ----- | ------------------------- |
-| `battery`     | Battery level                  | %     | `battery`                 |
-| `temperature` | Temperature                    | °C    | `temperature`             |
-| `humidity`    | Relative humidity              | %     | `humidity`                |
-| `co2`         | CO₂ concentration              | ppm   | `carbon_dioxide`          |
-| `pressure`    | Atmospheric pressure           | hPa   | `atmospheric_pressure`    |
-| `rssi`        | Signal strength                | dBm   | `signal_strength`         |
-| `loRaSNR`     | LoRa signal-to-noise ratio     | dB    | —                         |
+| Key                   | Description                | Unit | Device Class           |
+| --------------------- | -------------------------- | ---- | ---------------------- |
+| `battery`             | Battery level              | %    | `battery`              |
+| `temperature`         | Temperature                | °C   | `temperature`          |
+| `humidity`            | Relative humidity          | %    | `humidity`             |
+| `co2`                 | CO₂ concentration          | ppm  | `carbon_dioxide`       |
+| `pressure`            | Atmospheric pressure       | hPa  | `atmospheric_pressure` |
+| `rssi`                | Signal strength            | dBm  | `signal_strength`      |
+| `loRaSNR`             | LoRa signal-to-noise ratio | dB   | —                      |
+| `people_total_counts` | People counted in the area | —    | —                      |
 
 #### Binary Sensors (`binary_sensor` platform)
 
-| Key                          | Description           | Device Class  |
-| ---------------------------- | --------------------- | ------------- |
-| `occupancy`                  | Room occupancy        | `occupancy`   |
-| `pir` / `pir_trigger`        | Motion detection      | `motion`      |
-| `door`                       | Door/window contact   | `door`        |
-| `liquid` / `leakage_status`  | Water/liquid leakage  | `moisture`    |
-| `tamper`                     | Tamper detection      | `tamper`      |
+| Key                         | Description                         | Device Class |
+| --------------------------- | ----------------------------------- | ------------ |
+| `occupancy`                 | Room occupancy                      | `occupancy`  |
+| `people_total_counts`       | Occupied while the count is above 0 | `occupancy`  |
+| `pir` / `pir_trigger`       | Motion detection                    | `motion`     |
+| `door`                      | Door/window contact                 | `door`       |
+| `liquid` / `leakage_status` | Water/liquid leakage                | `moisture`   |
+| `tamper`                    | Tamper detection                    | `tamper`     |
 
 #### Special Sensors
 
