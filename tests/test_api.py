@@ -20,6 +20,9 @@ from custom_components.milesight_gateway.api import (
     APIAuthError,
     APIConnectionError,
     MilesightGatewayAPI,
+    _build_device,
+    _get_device_details,
+    _load_devices_db,
 )
 
 
@@ -200,3 +203,70 @@ async def test_offline_devices_are_counted_but_not_returned():
 
     assert devices == []
     assert (online, offline) == (0, 2)
+
+
+async def test_devices_without_an_eui_or_a_known_model_are_skipped():
+    """Only active devices with an EUI and a model definition become devices."""
+    client = _ok_client(
+        [
+            {"active": True},
+            {"devEUI": "ffffffffffffffff", "active": True},
+            {"devEUI": "24e124538b223213", "active": True, "name": "sensor"},
+        ]
+    )
+    api = _api(client)
+    await api.async_connect(MagicMock())
+
+    devices, online, offline = await api.async_get_devices(MagicMock())
+
+    assert [device.dev_eui for device in devices] == ["24e124538b223213"]
+    assert (online, offline) == (3, 0)
+
+
+# --- device database -------------------------------------------------------
+
+
+def test_an_unreadable_device_database_yields_no_models(tmp_path):
+    """A missing or broken database is logged and treated as empty."""
+    with patch(
+        "custom_components.milesight_gateway.api._DEVICES_DB_PATH",
+        tmp_path / "missing.json",
+    ):
+        assert _load_devices_db() == {"devices": []}
+
+
+DB = {
+    "devices": [
+        {"deveui": "24e124128", "name": "EM300-TH", "device_entities": ["a"]},
+        {"deveui": "24e124128", "name": "EM300-MCS", "device_entities": ["b"]},
+        {"deveui": "24e124999", "name": "WT101", "device_entities": ["c"]},
+        {"deveui": "24e124777", "name": "no entities"},
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    ("eui", "payload_name", "expected"),
+    [
+        ("24E1249990000001", "", "WT101"),
+        ("24e1241280000001", "em300-mcs", "EM300-MCS"),
+        ("24e1241280000001", "EM300-MCS_new", "EM300-MCS"),
+        ("24e1241280000001", "unknown", "EM300-TH"),
+        ("24e1247770000001", "", None),
+        ("0000000000000001", "", None),
+    ],
+)
+def test_device_model_lookup(eui, payload_name, expected):
+    """The EUI prefix picks the model; the payload name settles shared prefixes."""
+    details = _get_device_details(eui, DB, payload_name)
+    assert (details or {}).get("name") == expected
+
+
+def test_duplicate_and_unknown_keys_are_skipped():
+    """Each mapped key gives its entities once; unmapped keys give none."""
+    device = _build_device(
+        {"devEUI": "24e1241280000001", "name": "probe"},
+        {"device_entities": ["temperature", "temperature", "not_a_key"]},
+        "base",
+    )
+    assert [entity.key for entity in device.entities] == ["temperature"]
