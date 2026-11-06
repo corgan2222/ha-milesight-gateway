@@ -223,7 +223,13 @@ The enriched payload enables all diagnostic entities (RSSI, SNR, Last Seen, devi
 - Confirm the gateway is reachable from your Home Assistant host.
 - Check that the Secret Key and IV match the gateway's AES settings.
 
-### No sensor data / entities stuck as unavailable
+### Entities of a device are unavailable
+
+A device's entities are unavailable while the gateway cannot be reached, or while
+the gateway lists the device as inactive. They come back with the next device
+list refresh (every 5 minutes by default) once both are fine again.
+
+### No sensor data / entities stuck as unknown
 
 - Confirm the MQTT integration is running in Home Assistant.
 - Verify the MQTT broker is receiving uplink messages from the gateway.
