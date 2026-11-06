@@ -426,3 +426,83 @@ async def test_reconfigure_normalizes_the_url_and_still_dedupes(hass, mock_setup
     # Normalized before comparing, so the collision with the other entry is seen.
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+# --- URL validation --------------------------------------------------------
+
+BAD_URLS = [
+    ("192.168.2.180", "missing_scheme"),
+    ("192.168.2.180:8080", "missing_scheme"),
+    ("ftp://192.168.2.180", "missing_scheme"),
+    ("https://192.168.2.180:8080", "url_with_port"),
+    ("http://192.168.2.180:80", "url_with_port"),
+    ("https://192.168.2.180:port", "invalid_url"),
+    ("https://", "invalid_url"),
+    ("https://admin:secret@192.168.2.180", "invalid_url"),
+    ("https://192.168.2.180/api", "invalid_url"),
+    ("https://192.168.2.180?x=1", "invalid_url"),
+]
+
+
+@pytest.mark.parametrize(("typed", "expected"), BAD_URLS)
+async def test_user_flow_explains_an_unusable_url(
+    hass, mock_setup_entry, typed, expected
+):
+    """An unusable URL is named at the field, without trying to connect."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    connect = AsyncMock(return_value=True)
+    with patch(CONNECT, connect):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_GATEWAY_URL: expected}
+    connect.assert_not_awaited()
+
+    with patch(CONNECT, AsyncMock(return_value=True)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], USER_INPUT
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.parametrize("typed", ["http://192.168.2.180", "https://gateway.local"])
+async def test_user_flow_accepts_http_and_host_names(hass, mock_setup_entry, typed):
+    """Both schemes and host names are fine."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    with patch(CONNECT, AsyncMock(return_value=True)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_GATEWAY_URL] == typed
+
+
+@pytest.mark.parametrize(("typed", "expected"), BAD_URLS[:4])
+async def test_reconfigure_explains_an_unusable_url(
+    hass, mock_setup_entry, typed, expected
+):
+    """Reconfigure names the URL problem too and keeps the stored address."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    result = await entry.start_reconfigure_flow(hass)
+    connect = AsyncMock(return_value=True)
+    with patch(CONNECT, connect):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_GATEWAY_URL: expected}
+    connect.assert_not_awaited()
+    assert entry.data[CONF_GATEWAY_URL] == "https://192.168.2.180"

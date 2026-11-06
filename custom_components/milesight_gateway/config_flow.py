@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import voluptuous as vol
 from homeassistant.config_entries import (
@@ -86,6 +87,30 @@ def _clean_url(url: str) -> str:
     return url.strip().rstrip("/")
 
 
+def _url_error(url: str) -> str | None:
+    """
+    Return why a cleaned gateway URL cannot be used, or None if it can.
+
+    The client appends ":{port}/api/..." to the URL, so anything but a bare
+    scheme and host builds an address that never reaches the gateway, and
+    would otherwise only surface as a generic "cannot connect".
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        return "missing_scheme"
+    try:
+        port = parts.port
+    except ValueError:
+        return "invalid_url"
+    if not parts.hostname or parts.username or parts.password:
+        return "invalid_url"
+    if port is not None:
+        return "url_with_port"
+    if parts.path or parts.query or parts.fragment:
+        return "invalid_url"
+    return None
+
+
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate the user input allows us to connect."""
     api = MilesightGatewayAPI(
@@ -130,16 +155,20 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             user_input[CONF_GATEWAY_URL] = _clean_url(user_input[CONF_GATEWAY_URL])
-            try:
-                info = await validate_input(self.hass, user_input)
-            except CannotConnectError:
-                errors["base"] = "cannot_connect"
-            except InvalidAuthError:
-                errors["base"] = "invalid_auth"
-            except Exception:
-                _LOGGER.exception("Unexpected exception")
-                errors["base"] = "unknown"
+            info: dict[str, Any] = {}
+            if url_error := _url_error(user_input[CONF_GATEWAY_URL]):
+                errors[CONF_GATEWAY_URL] = url_error
             else:
+                try:
+                    info = await validate_input(self.hass, user_input)
+                except CannotConnectError:
+                    errors["base"] = "cannot_connect"
+                except InvalidAuthError:
+                    errors["base"] = "invalid_auth"
+                except Exception:
+                    _LOGGER.exception("Unexpected exception")
+                    errors["base"] = "unknown"
+            if not errors:
                 unique_id = f"{user_input[CONF_GATEWAY_URL]}:{user_input[CONF_PORT]}"
                 await self.async_set_unique_id(unique_id)
                 self._abort_if_unique_id_configured()
@@ -209,16 +238,19 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                 if key != CONF_PASSWORD or value
             }
             merged = {**entry.data, **updates}
-            try:
-                await validate_input(self.hass, merged)
-            except CannotConnectError:
-                errors["base"] = "cannot_connect"
-            except InvalidAuthError:
-                errors["base"] = "invalid_auth"
-            except Exception:
-                _LOGGER.exception("Unexpected exception")
-                errors["base"] = "unknown"
+            if url_error := _url_error(merged[CONF_GATEWAY_URL]):
+                errors[CONF_GATEWAY_URL] = url_error
             else:
+                try:
+                    await validate_input(self.hass, merged)
+                except CannotConnectError:
+                    errors["base"] = "cannot_connect"
+                except InvalidAuthError:
+                    errors["base"] = "invalid_auth"
+                except Exception:
+                    _LOGGER.exception("Unexpected exception")
+                    errors["base"] = "unknown"
+            if not errors:
                 # Skips the entry being reconfigured, so moving this gateway to
                 # a new address is allowed while colliding with another is not.
                 self._async_abort_entries_match(
