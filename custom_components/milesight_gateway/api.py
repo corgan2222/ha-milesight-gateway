@@ -30,8 +30,9 @@ _LOGGER = logging.getLogger(__name__)
 _DEVICES_DB_PATH = pathlib.Path(__file__).parent / "devices_ha.json"
 
 # Maps known entity keys to their HA metadata.
-# Only keys present here will become entities.
-ENTITY_MAPPING: dict[str, dict[str, Any]] = {
+# Only keys present here will become entities. A list gives one key several
+# entities; they need different platforms, since the unique id is the key.
+ENTITY_MAPPING: dict[str, dict[str, Any] | list[dict[str, Any]]] = {
     "battery": {
         "platform": "sensor",
         "device_class": "battery",
@@ -90,13 +91,21 @@ ENTITY_MAPPING: dict[str, dict[str, Any]] = {
         "device_class": "occupancy",
         "enabled_by_default": True,
     },
-    "people_total_counts": {
-        "platform": "binary_sensor",
-        "unit_of_measurement": "people",
-        "icon": "mdi:account-group",
-        "device_class": "occupancy",
-        "enabled_by_default": True,
-    },
+    "people_total_counts": [
+        {
+            "platform": "binary_sensor",
+            "device_class": "occupancy",
+            "enabled_by_default": True,
+            "name": "Occupancy",
+        },
+        {
+            "platform": "sensor",
+            "icon": "mdi:account-group",
+            "state_class": "measurement",
+            "enabled_by_default": True,
+            "name": "People count",
+        },
+    ],
     "pir": {
         "platform": "binary_sensor",
         "device_class": "motion",
@@ -281,18 +290,19 @@ def _build_device(
         if mapping is None:
             continue
 
-        entities.append(
+        entities.extend(
             EntityDefinition(
                 key=key,
-                name=mapping.get("name", _format_name(key)),
-                platform=mapping.get("platform", "sensor"),
-                unit=mapping.get("unit"),
-                device_class=mapping.get("device_class"),
-                state_class=mapping.get("state_class"),
-                entity_category=mapping.get("entity_category"),
-                icon=mapping.get("icon"),
-                enabled_by_default=mapping.get("enabled_by_default", True),
+                name=spec.get("name", _format_name(key)),
+                platform=spec.get("platform", "sensor"),
+                unit=spec.get("unit"),
+                device_class=spec.get("device_class"),
+                state_class=spec.get("state_class"),
+                entity_category=spec.get("entity_category"),
+                icon=spec.get("icon"),
+                enabled_by_default=spec.get("enabled_by_default", True),
             )
+            for spec in (mapping if isinstance(mapping, list) else [mapping])
         )
 
     return MilesightDevice(

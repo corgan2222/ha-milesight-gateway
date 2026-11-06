@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.mqtt import async_subscribe
@@ -32,7 +32,22 @@ _LOGGER = logging.getLogger(__name__)
 PARALLEL_UPDATES = 0
 
 # Values that map to True (active/on) for binary sensors
-_TRUTHY_VALUES = {True, "true", "1", "on", "open", "motion", "occupied"}
+_TRUTHY_VALUES = {"true", "on", "open", "motion", "occupied"}
+
+
+def is_on(value: Any) -> bool:
+    """
+    Return whether a payload value means active.
+
+    Numbers count as on above zero, so a people count of 2 still reads as
+    occupied. Anything else is matched against the known words.
+    """
+    if isinstance(value, bool):
+        return value
+    try:
+        return float(value) > 0
+    except TypeError, ValueError:
+        return str(value).lower() in _TRUTHY_VALUES
 
 
 async def async_setup_entry(
@@ -124,5 +139,5 @@ class MilesightBinarySensor(BinarySensorEntity):
         if value is None:
             return
 
-        self._attr_is_on = str(value).lower() in _TRUTHY_VALUES
+        self._attr_is_on = is_on(value)
         self.async_write_ha_state()
