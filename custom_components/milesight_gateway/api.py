@@ -273,7 +273,7 @@ def _build_device(
 ) -> MilesightDevice:
     """Build a MilesightDevice from gateway data + model definition."""
     dev_eui = raw_device.get("devEUI", "")
-    name = raw_device.get("name", "Unknown Device")
+    name = raw_device.get("name") or "Unknown Device"
     model = device_details.get("description") or device_details.get("name", "")
     model_id = device_details.get("id", "")
     data_topic = f"{mqtt_base_topic}/{dev_eui.lower()}"
@@ -429,6 +429,8 @@ class MilesightGatewayAPI:
         offline_count = 0
 
         for raw in all_devices:
+            if not isinstance(raw, dict):
+                continue
             if raw.get("active"):
                 online_count += 1
             else:
@@ -436,10 +438,11 @@ class MilesightGatewayAPI:
                 continue
 
             dev_eui = raw.get("devEUI")
-            if not dev_eui:
+            if not isinstance(dev_eui, str) or not dev_eui:
                 continue
 
-            payload_name = raw.get("payloadName", "")
+            # The gateway sends null for a device without a payload codec.
+            payload_name = raw.get("payloadName") or ""
             device_details = _get_device_details(
                 dev_eui, self._devices_db, payload_name
             )

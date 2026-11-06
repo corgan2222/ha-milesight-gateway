@@ -6,6 +6,9 @@
             "reauth_successful": "Re-authentication was successful"
         },
         "error": {
+            "missing_scheme": "Start the URL with http:// or https://, for example https://192.168.2.180.",
+            "url_with_port": "Leave the port out of the URL and enter it in the Port field.",
+            "invalid_url": "Enter only the gateway's address, for example https://192.168.2.180, without a path or user name.",
             "cannot_connect": "Failed to connect",
             "invalid_auth": "Invalid authentication",
             "unknown": "Unexpected error"
@@ -38,7 +41,7 @@
                     "gateway_mqtt_base_topic": "MQTT uplink base topic"
                 },
                 "data_description": {
-                    "gateway_url": "The URL of your Milesight gateway, for example `https://192.168.2.180`. Change this if the gateway moved to a different address.",
+                    "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.168.2.180`. Change this if the gateway moved to a different address.",
                     "port": "The port of the gateway API.",
                     "username": "The username to log in to the Milesight gateway.",
                     "password": "The new password to log in to the Milesight gateway.",
@@ -60,7 +63,7 @@
                     "gateway_mqtt_base_topic": "MQTT uplink base topic"
                 },
                 "data_description": {
-                    "gateway_url": "The URL of your Milesight gateway, for example `https://192.168.2.180`.",
+                    "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.168.2.180`.",
                     "port": "The port of the gateway API.",
                     "username": "The username to log in to the Milesight gateway.",
                     "password": "The password to log in to the Milesight gateway.",

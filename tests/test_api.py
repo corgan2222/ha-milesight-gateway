@@ -223,6 +223,33 @@ async def test_devices_without_an_eui_or_a_known_model_are_skipped():
     assert (online, offline) == (3, 0)
 
 
+async def test_null_fields_in_the_device_list_are_tolerated():
+    """The gateway sends null for a missing codec or name, and junk is skipped."""
+    client = _ok_client(
+        [
+            "not a device",
+            {"devEUI": 12345, "active": True},
+            # The AM307 family shares this EUI prefix, so the payload name is
+            # consulted; null must not break the whole device list.
+            {
+                "devEUI": "24E124707E111005",
+                "active": True,
+                "name": None,
+                "payloadName": None,
+            },
+        ]
+    )
+    api = _api(client)
+    await api.async_connect(MagicMock())
+
+    devices, online, offline = await api.async_get_devices(MagicMock())
+
+    assert [(device.dev_eui, device.name) for device in devices] == [
+        ("24E124707E111005", "Unknown Device")
+    ]
+    assert (online, offline) == (2, 0)
+
+
 # --- device database -------------------------------------------------------
 
 
