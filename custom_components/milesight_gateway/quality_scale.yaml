@@ -15,12 +15,7 @@ rules:
       Custom integration: ships local brand images under brand/ as
       documented for custom integrations, which is what the HACS brands
       check validates. No home-assistant/brands pull request exists.
-  common-modules:
-    status: exempt
-    comment: >-
-      The coordinator lives in coordinator.py. There is no base entity
-      class shared across platforms, so entity.py would hold nothing but a
-      DeviceInfo helper.
+  common-modules: done
   config-flow-test-coverage: done
   config-flow: done
   dependency-transparency: done
@@ -45,11 +40,7 @@ rules:
   config-entry-unloading: done
   docs-configuration-parameters: done
   docs-installation-parameters: done
-  entity-unavailable:
-    status: todo
-    comment: >-
-      The gateway diagnostic sensors inherit availability from the coordinator,
-      but the MQTT-driven device entities have no availability handling yet.
+  entity-unavailable: done
   integration-owner: done
   log-when-unavailable: done
   parallel-updates: done

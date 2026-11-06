@@ -10,14 +10,12 @@ or poll independently.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from homeassistant.components.mqtt import async_subscribe
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -31,6 +29,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_GATEWAY_URL, DOMAIN
 from .coordinator import MilesightGatewayCoordinator
+from .entity import MilesightDeviceEntity
 
 if TYPE_CHECKING:
     from homeassistant.components.mqtt.models import ReceiveMessage
@@ -101,22 +100,6 @@ async def async_setup_entry(
         )
 
     async_add_entities(entities)
-
-
-def _device_info(
-    device: MilesightDevice, configuration_url: str, gateway_device_id: str
-) -> DeviceInfo:
-    """Build DeviceInfo for a LoRaWAN device."""
-    return DeviceInfo(
-        identifiers={(DOMAIN, device.dev_eui)},
-        name=device.name,
-        manufacturer="Milesight",
-        model=device.model or None,
-        model_id=device.model_id or None,
-        serial_number=device.dev_eui,
-        configuration_url=configuration_url,
-        via_device_id=gateway_device_id,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,22 +209,19 @@ class MilesightGatewayPingSensor(
 # ---------------------------------------------------------------------------
 
 
-class MilesightSensor(SensorEntity):
+class MilesightSensor(MilesightDeviceEntity, SensorEntity):
     """A sensor whose state is updated via MQTT."""
-
-    _attr_has_entity_name = True
-    _attr_should_poll = False
 
     def __init__(
         self,
-        _coordinator: MilesightGatewayCoordinator,
+        coordinator: MilesightGatewayCoordinator,
         device: MilesightDevice,
         entity_def: EntityDefinition,
         configuration_url: str,
         gateway_id: str,
     ) -> None:
         """Initialize the sensor from the entity definition provided by the API."""
-        self._data_topic = device.data_topic
+        super().__init__(coordinator, device, configuration_url, gateway_id)
         self._entity_key = entity_def.key
 
         self._attr_unique_id = f"{device.dev_eui}_{entity_def.key}"
@@ -259,40 +239,10 @@ class MilesightSensor(SensorEntity):
         if entity_def.entity_category:
             self._attr_entity_category = EntityCategory(entity_def.entity_category)
 
-        self._attr_device_info = _device_info(device, configuration_url, gateway_id)
-
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to the device MQTT topic when added to HA."""
-        _LOGGER.debug(
-            "Subscribing to MQTT topic: %s (key: %s)",
-            self._data_topic,
-            self._entity_key,
-        )
-        try:
-            self.async_on_remove(
-                await async_subscribe(
-                    self.hass,
-                    self._data_topic,
-                    self._handle_mqtt_message,
-                )
-            )
-        except Exception:
-            _LOGGER.exception("Failed to subscribe to MQTT topic %s", self._data_topic)
-            raise
-
     @callback
     def _handle_mqtt_message(self, msg: ReceiveMessage) -> None:
         """Parse incoming MQTT payload and update state."""
-        _LOGGER.debug("MQTT message on %s: %s", self._data_topic, msg.payload)
-        try:
-            payload = json.loads(msg.payload)
-        except json.JSONDecodeError, ValueError:
-            _LOGGER.warning(
-                "Invalid JSON on topic %s: %s", self._data_topic, msg.payload
-            )
-            return
-
-        value = payload.get(self._entity_key)
+        value = self._read_value(msg, self._entity_key)
         if value is None:
             _LOGGER.debug(
                 "Key %s not found in payload for topic %s",
@@ -301,57 +251,27 @@ class MilesightSensor(SensorEntity):
             )
             return
 
-        # Timestamp sensors require a timezone-aware datetime, not a raw string.
-        if self._attr_device_class == SensorDeviceClass.TIMESTAMP and isinstance(
-            value, str
-        ):
-            try:
-                value = datetime.fromisoformat(value)
-            except ValueError:
-                _LOGGER.warning(
-                    "Cannot parse timestamp value %r for key %s on topic %s",
-                    value,
-                    self._entity_key,
-                    self._data_topic,
-                )
-                return
-
-        _LOGGER.debug("Updating %s = %s", self._entity_key, value)
         self._attr_native_value = value
         self.async_write_ha_state()
 
 
-class MilesightLastSeenSensor(SensorEntity):
+class MilesightLastSeenSensor(MilesightDeviceEntity, SensorEntity):
     """Timestamp sensor that updates whenever any MQTT message arrives for a device."""
 
-    _attr_has_entity_name = True
-    _attr_should_poll = False
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_entity_registry_enabled_default = True
     _attr_name = "Last seen"
 
     def __init__(
         self,
-        _coordinator: MilesightGatewayCoordinator,
+        coordinator: MilesightGatewayCoordinator,
         device: MilesightDevice,
         configuration_url: str,
         gateway_id: str,
     ) -> None:
         """Initialize the last-seen sensor."""
-        self._data_topic = device.data_topic
+        super().__init__(coordinator, device, configuration_url, gateway_id)
         self._attr_unique_id = f"{device.dev_eui}_last_seen"
-        self._attr_device_info = _device_info(device, configuration_url, gateway_id)
-
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to the device MQTT topic when added to HA."""
-        self.async_on_remove(
-            await async_subscribe(
-                self.hass,
-                self._data_topic,
-                self._handle_mqtt_message,
-            )
-        )
 
     @callback
     def _handle_mqtt_message(self, _msg: ReceiveMessage) -> None:
