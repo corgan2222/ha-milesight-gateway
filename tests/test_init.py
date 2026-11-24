@@ -25,7 +25,7 @@ from custom_components.milesight_gateway.const import (
 )
 
 ENTRY_DATA = {
-    CONF_GATEWAY_URL: "https://192.168.2.180",
+    CONF_GATEWAY_URL: "https://192.0.2.10",
     CONF_PORT: 8080,
     CONF_USERNAME: "admin",
     CONF_PASSWORD: "secret",
@@ -34,7 +34,7 @@ ENTRY_DATA = {
     CONF_GATEWAY_MQTT_BASE_TOPIC: "sensors/lora/uplink",
 }
 
-LEGACY_ID = "https://192.168.2.180:8080"
+LEGACY_ID = "https://192.0.2.10:8080"
 
 
 def _entry(minor_version: int = 1) -> MockConfigEntry:
@@ -56,7 +56,7 @@ async def test_migration_moves_the_gateway_device_to_the_entry_id(hass):
     gateway = registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, LEGACY_ID)},
-        name="Milesight Gateway (https://192.168.2.180)",
+        name="Milesight Gateway (https://192.0.2.10)",
     )
     # A child device pointing at the gateway, as the platforms create them.
     child = registry.async_get_or_create(

@@ -8,7 +8,9 @@ rules:
     comment: >-
       The coordinator polls the device list every 300 s by default, which
       suits how rarely it changes; sensor states arrive by MQTT push. The
-      options flow exposes the interval for large fleets, minimum 60 s.
+      gateway status has its own interval, also 300 s by default, and the
+      firmware check runs every 12 hours. The options flow exposes both
+      intervals, minimum 60 s.
   brands:
     status: exempt
     comment: >-
@@ -35,8 +37,11 @@ rules:
 
   # Silver
   action-exceptions:
-    status: exempt
-    comment: Integration does not register custom actions.
+    status: done
+    comment: >-
+      No custom actions, but the entity actions of the control platforms send
+      downlinks; a gateway that does not take one raises a translated
+      HomeAssistantError and the entity keeps its previous state.
   config-entry-unloading: done
   docs-configuration-parameters: done
   docs-installation-parameters: done
@@ -49,7 +54,11 @@ rules:
 
   # Gold
   devices: done
-  diagnostics: todo
+  diagnostics:
+    status: done
+    comment: >-
+      Options, matched models with their entity keys, and the gateway status.
+      Credentials, addresses, serial numbers, EUIs and names are redacted.
   discovery-update-info: todo
   discovery: todo
   docs-data-update: done
