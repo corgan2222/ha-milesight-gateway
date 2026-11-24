@@ -78,7 +78,9 @@ class LoRaWANRuntime:
         self._listeners: list[Callable[[MilesightLoRaWANCoordinator], None]] = []
         self._cleanup: list[Callable[[], None]] = []
         self._gateways: list[dict[str, Any]] = []
-        self._gateways_read = 0.0
+        # None until the first read: the monotonic clock starts near zero
+        # after a boot, so "0.0" would look like a fresh read for 5 minutes.
+        self._gateways_read: float | None = None
 
     async def async_start(self) -> None:
         """Connect, create the device models and unpack their codecs."""
@@ -168,7 +170,8 @@ class LoRaWANRuntime:
 
     async def async_gateways(self) -> list[dict[str, Any]]:
         """Return the network server's gateways, read at most every 5 minutes."""
-        if time.monotonic() - self._gateways_read > GATEWAY_CACHE_SECONDS:
+        read = self._gateways_read
+        if read is None or time.monotonic() - read > GATEWAY_CACHE_SECONDS:
             self._gateways = await self.connection.async_get_gateways()
             self._gateways_read = time.monotonic()
         return self._gateways

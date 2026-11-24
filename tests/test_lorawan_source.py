@@ -389,6 +389,17 @@ async def test_a_setting_goes_out_as_raw_bytes(hass, mqtt_entry, connection):
     assert downlink.data  # the encoder's bytes, not JSON for a gateway codec
 
 
+async def test_gateways_are_read_right_after_a_boot(hass, mqtt_entry, connection):
+    """The monotonic clock starts near zero after a boot; the first read happens."""
+    await _switch_to_lorawan(hass, mqtt_entry)
+    runtime = mqtt_entry.runtime_data.lorawan
+
+    with patch(f"{LORAWAN}.time.monotonic", return_value=5.0):
+        gateways = await runtime.async_gateways()
+
+    assert [gateway["id"] for gateway in gateways] == [GATEWAY]
+
+
 async def test_the_network_command_lists_gateways_and_receptions(
     hass, hass_ws_client, mqtt_entry, connection
 ):
