@@ -35,7 +35,8 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_GATEWAY_URL, DOMAIN
+from . import lorawan_platforms
+from .const import CONF_GATEWAY_URL, DOMAIN, SOURCE_LORAWAN, data_source
 from .coordinator import (
     DiagnosticsData,
     MilesightDiagnosticsCoordinator,
@@ -108,7 +109,9 @@ async def async_setup_entry(
         ),
     ]
 
-    for device in coordinator.data.devices:
+    lorawan = data_source(config_entry.options) == SOURCE_LORAWAN
+    # The LoRaWAN source adds its device sensors below, as devices report.
+    for device in () if lorawan else coordinator.data.devices:
         entities.extend(
             MilesightSensor(coordinator, device, entity_def, gateway_url, gateway_id)
             for entity_def in device.entities
@@ -147,6 +150,10 @@ async def async_setup_entry(
         )
 
     async_add_entities(entities)
+    if lorawan:
+        await lorawan_platforms.async_setup_sensors(
+            hass, config_entry, async_add_entities
+        )
 
 
 # ---------------------------------------------------------------------------

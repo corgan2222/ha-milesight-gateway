@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
 from .api import APIAuthError, APIConnectionError, MilesightGatewayAPI
 from .const import (
+    CONF_ALL_SETTINGS,
+    CONF_DATA_SOURCE,
     CONF_DEVICES,
     CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
@@ -53,6 +55,9 @@ from .const import (
     DEFAULT_SECRET_KEY,
     DOMAIN,
     MIN_SCAN_INTERVAL,
+    SOURCE_LORAWAN,
+    SOURCE_MQTT,
+    data_source,
 )
 from .coordinator import status_interval
 
@@ -158,6 +163,17 @@ def device_choices(devices: list[MilesightDevice]) -> list[SelectOptionDict]:
     ]
 
 
+def source_selector() -> SelectSelector:
+    """Return the choice between MQTT and the LoRaWAN packet log."""
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=[SOURCE_LORAWAN, SOURCE_MQTT],
+            mode=SelectSelectorMode.LIST,
+            translation_key=CONF_DATA_SOURCE,
+        )
+    )
+
+
 def device_selector(choices: list[SelectOptionDict]) -> SelectSelector:
     """Return the searchable multi-select for the device choice."""
     return SelectSelector(
@@ -216,8 +232,6 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._abort_if_unique_id_configured()
                 self._data = user_input
                 self._choices = await self._async_list_devices(info["api"])
-                if not self._choices:
-                    return self.async_create_entry(title=info["title"], data=user_input)
                 return await self.async_step_devices()
 
         return self.async_show_form(
@@ -237,13 +251,25 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(
                 title=self._data[CONF_GATEWAY_URL],
                 data=self._data,
-                options={CONF_DEVICES: user_input.get(CONF_DEVICES, [])},
+                options={
+                    CONF_DATA_SOURCE: user_input.get(CONF_DATA_SOURCE, SOURCE_LORAWAN),
+                    CONF_DEVICES: user_input.get(CONF_DEVICES, []),
+                },
+            )
+        # New entries default to the LoRaWAN source: no broker needed, and
+        # every model Milesight publishes a codec for is known.
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_DATA_SOURCE, default=SOURCE_LORAWAN): source_selector()
+        }
+        # Without a device list there is nothing to pick; all are taken, and
+        # the options can narrow them down later.
+        if self._choices:
+            schema[vol.Optional(CONF_DEVICES, default=[])] = device_selector(
+                self._choices
             )
         return self.async_show_form(
             step_id="devices",
-            data_schema=vol.Schema(
-                {vol.Optional(CONF_DEVICES, default=[]): device_selector(self._choices)}
-            ),
+            data_schema=vol.Schema(schema),
             description_placeholders={"count": str(len(self._choices))},
         )
 
@@ -396,6 +422,12 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
             vol.Required(
                 CONF_FIRMWARE_CHECK,
                 default=options.get(CONF_FIRMWARE_CHECK, True),
+            ): bool,
+            vol.Required(
+                CONF_DATA_SOURCE, default=data_source(options)
+            ): source_selector(),
+            vol.Required(
+                CONF_ALL_SETTINGS, default=options.get(CONF_ALL_SETTINGS, False)
             ): bool,
         }
         # The choice needs the gateway's device list, so it is only offered

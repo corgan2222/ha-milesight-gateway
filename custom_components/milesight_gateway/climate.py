@@ -21,7 +21,8 @@ from homeassistant.components.climate import (
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 
-from .const import CONF_GATEWAY_URL
+from . import lorawan_platforms
+from .const import CONF_GATEWAY_URL, SOURCE_LORAWAN, data_source
 from .entity import MilesightDeviceEntity
 
 if TYPE_CHECKING:
@@ -60,6 +61,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Create a climate entity for every device that reports a target."""
+    if data_source(config_entry.options) == SOURCE_LORAWAN:
+        await lorawan_platforms.async_setup_climates(
+            _hass, config_entry, async_add_entities
+        )
+        return
     coordinator = config_entry.runtime_data.coordinator
     gateway_url = config_entry.data[CONF_GATEWAY_URL]
     gateway_id = config_entry.runtime_data.gateway_device_id

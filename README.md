@@ -14,14 +14,26 @@ A custom Home Assistant integration that bridges **Milesight LoRaWAN gateways** 
 
 ## How It Works
 
-The integration uses two communication channels:
+The integration talks to the gateway's local HTTP API: it logs in (JWT), reads
+the device list and the gateway's status, and queues downlinks that change
+device settings. Sensor values come from one of two data sources, chosen per
+gateway:
 
-| Channel            | Purpose                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------ |
-| **HTTP REST API**  | Authenticates locally with the gateway (JWT) and fetches the list of connected LoRaWAN devices from the gateway. Only online devices will be synced. Also reads the gateway's status and queues downlinks that change device settings. |
-| **MQTT (push)**    | Receives real-time sensor telemetry from LoRaWAN devices via the gateway's uplink topic   |
+| Data source | How values arrive | Decoded by |
+| ----------- | ----------------- | ---------- |
+| **LoRaWAN** (default for new entries) | The integration reads the network server's packet log every 10 seconds. No MQTT broker needed. | Milesight's own codecs for every model they publish, bundled in [Milesight-Gateway-API](https://github.com/corgan2222/Milesight-Gateway-API) |
+| **MQTT** | The gateway publishes each uplink to your broker; the integration subscribes. | The payload codecs set up on the gateway |
 
-Device entity definitions are matched from a built-in database of 130+ Milesight device models (`devices_ha.json`). Once matched, the integration automatically creates the appropriate sensor and binary sensor entities for each device.
+With MQTT, device entities are matched from a built-in database of 130+
+Milesight device models (`devices_ha.json`). With LoRaWAN, entities follow
+Milesight's codec catalog: a reading gets an entity once the device reports
+it, settings and commands get one from the start.
+
+Entries created before the option existed stay on MQTT; switching is an option
+(see [Options](#options)). Fields both sources know keep their entity, entity
+ID and history when you switch; entities only the other source provides are
+removed. On Home Assistant 2026.11 or newer, a LoRaWAN gateway also registers
+with Home Assistant's LoRaWAN integration.
 
 ---
 
@@ -30,11 +42,10 @@ Device entity definitions are matched from a built-in database of 130+ Milesight
 ## Requirements
 
 - Home Assistant 2026.9.0 or newer
-- A running [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) in Home Assistant
 - A Milesight LoRaWAN gateway reachable from your Home Assistant instance
 - Gateway credentials (username & password)
 - Gateway AES encryption settings (Secret Key & IV — found in the gateway's security settings)
-- The gateway must be configured to publish LoRaWAN uplinks to your MQTT broker
+- MQTT data source only: a running [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) and the gateway set up to publish LoRaWAN uplinks to your broker
 
 
 ---
@@ -81,8 +92,9 @@ Go to **Settings → Devices & Services → Add Integration** and search for **M
 | **IV**                     | 16-character AES initialization vector (from gateway security settings) | `2222222222222222`  |
 | **MQTT Uplink Base Topic** | Base MQTT topic where the gateway publishes device data               | `sensors/lora/uplink` |
 
-A second step lists the gateway's devices with a known model. Pick the ones that
-should get entities, or leave the list empty for all of them. On a network with
+A second step asks for the [data source](#how-it-works) and lists the gateway's
+devices with a known model. Pick the ones that should get entities, or leave
+the list empty for all of them. On a network with
 hundreds of sensors, this keeps Home Assistant from creating them all first.
 The list is searchable by name, model and devEUI, and the choice can be changed
 later in the options.
@@ -100,8 +112,10 @@ After setup, open **Configure** on the integration entry:
 | **Read the web interface**     | Log in to the gateway's web interface for CPU, memory, storage, uptime and serial number | on | |
 | **Check for new firmware**     | Look up the newest gateway firmware on milesight.com                         | on      |      |
 | **Devices**                    | Only the picked devices get entities. The list is searchable by name, model and devEUI | all |  |
+| **Data source**                | LoRaWAN (packet log) or MQTT; see [How It Works](#how-it-works)              | MQTT for entries from before the option, LoRaWAN for new ones | |
+| **Entities for all device settings** | LoRaWAN only. Off: report interval, target temperature, reboot and status report. On: about 25 more per device, disabled until you enable them | off | |
 
-> The polling interval only controls the device list. Sensor state updates are pushed via MQTT and are always real-time.
+> The polling interval only controls the device list. Sensor values arrive as they are sent: by MQTT, or from the packet log within 10 seconds.
 
 Switching a source off removes the entities that only it could fill; switching
 it back on brings them back with the same entity IDs. Entries created before
@@ -110,6 +124,42 @@ the status interval existed keep using the polling interval for it.
 A device you take out of the **Devices** list is removed from Home Assistant
 with its entities; a device that is only offline is not affected. The list can
 only be shown while the integration is loaded, since it comes from the gateway.
+
+### LoRaWAN network map
+
+With the LoRaWAN data source, a **LoRaWAN network** panel appears in the
+sidebar. It shows each gateway entry, every gateway of its network server
+(a fleet hub's silent gateways too) and the devices, grouped around the gateway
+that hears them best. Each reception is a line labelled with RSSI and SNR and
+coloured by link quality; the weaker of the two values decides:
+
+| Colour | RSSI | SNR |
+| ------ | ---- | --- |
+| green  | ≥ −100 dBm | ≥ 0 dB |
+| yellow | ≥ −110 dBm | ≥ −5 dB |
+| orange | ≥ −120 dBm | ≥ −10 dB |
+| red    | below | below |
+
+![The LoRaWAN network panel with a single gateway and a fleet hub with its gateways](docs/images/network-map.png)
+
+Nodes can be dragged; a double-click lets one go back. Two sliders set the
+length of the stems from an entry to its gateways and from a gateway to its
+devices. The same map is a dashboard card, loaded by the integration itself:
+
+```yaml
+type: custom:milesight-lorawan-map
+gateway: https://192.0.2.10      # entry title or ID; all entries when left out
+height: 500px
+title: Fleet                      # empty hides the title
+labels: true                      # RSSI and SNR on the lines
+```
+
+On Home Assistant 2026.11 or newer, the gateways and devices also show up in
+Home Assistant's own LoRaWAN integration and its network map:
+
+| Overview | Network map | Fleet |
+| -------- | ----------- | ----- |
+| ![Home Assistant's LoRaWAN overview with its connections and devices](docs/images/ha-lorawan-overview.png) | ![Home Assistant's LoRaWAN network map](docs/images/ha-lorawan-map.webp) | ![A fleet hub with its gateways and devices in Home Assistant's LoRaWAN map](docs/images/ha-lorawan-tree.png) |
 
 ---
 

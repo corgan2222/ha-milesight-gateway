@@ -26,6 +26,7 @@ ignore = [
     "ARG001",  # pytest fixtures are injected for side effects, not always used directly
     "RET504",  # assignment before return aids test readability
     "PLC0415", # lazy imports used for patching in some test patterns
+    "F811",    # a fixture imported from another test module is a parameter here
 ]
 
 [lint.flake8-pytest-style]
