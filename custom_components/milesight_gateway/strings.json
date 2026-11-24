@@ -14,13 +14,23 @@
           "gateway_mqtt_base_topic": "MQTT uplink base topic"
         },
         "data_description": {
-          "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.168.2.180`.",
+          "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.0.2.10`.",
           "port": "The port of the gateway API.",
           "username": "The username to log in to the Milesight gateway.",
           "password": "The password to log in to the Milesight gateway.",
           "secret_key": "The 16-character AES encryption key for the gateway password.",
           "iv": "The 16-character AES initialization vector for the gateway password.",
           "gateway_mqtt_base_topic": "The MQTT topic prefix for sensor uplink messages, for example `sensors/lora/uplink`."
+        }
+      },
+      "devices": {
+        "title": "Choose devices",
+        "description": "The gateway lists {count} devices with a known model. Pick the ones that should get entities in Home Assistant, or leave the list empty for all of them.",
+        "data": {
+          "devices": "Devices"
+        },
+        "data_description": {
+          "devices": "Searchable by name, model and devEUI. You can change the choice later in the options."
         }
       },
       "reauth_confirm": {
@@ -52,7 +62,7 @@
           "gateway_mqtt_base_topic": "MQTT uplink base topic"
         },
         "data_description": {
-          "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.168.2.180`. Change this if the gateway moved to a different address.",
+          "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.0.2.10`. Change this if the gateway moved to a different address.",
           "port": "The port of the gateway API.",
           "username": "The username to log in to the Milesight gateway.",
           "password": "The new password to log in to the Milesight gateway.",
@@ -63,9 +73,9 @@
       }
     },
     "error": {
-      "missing_scheme": "Start the URL with http:// or https://, for example https://192.168.2.180.",
+      "missing_scheme": "Start the URL with http:// or https://, for example https://192.0.2.10.",
       "url_with_port": "Leave the port out of the URL and enter it in the Port field.",
-      "invalid_url": "Enter only the gateway's address, for example https://192.168.2.180, without a path or user name.",
+      "invalid_url": "Enter only the gateway's address, for example https://192.0.2.10, without a path or user name.",
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]"
@@ -81,10 +91,18 @@
       "init": {
         "title": "Milesight Gateway options",
         "data": {
-          "scan_interval": "Polling interval (seconds)"
+          "scan_interval": "Polling interval (seconds)",
+          "status_interval": "Status interval (seconds)",
+          "web_data": "Read the web interface",
+          "firmware_check": "Check for new firmware",
+          "devices": "Devices"
         },
         "data_description": {
-          "scan_interval": "How often to poll the gateway for updated sensor data."
+          "scan_interval": "How often to read the device list from the gateway. Sensor values arrive by MQTT as soon as they are sent.",
+          "status_interval": "How often to read the gateway's status: links, packets, CPU and memory.",
+          "web_data": "Log in to the gateway's web interface for its serial number, CPU load, memory, storage and uptime. Uses the same account.",
+          "firmware_check": "Look up the newest gateway firmware on milesight.com twice a day.",
+          "devices": "Only these devices get entities. Leave empty for all devices. Devices you remove from the list are removed from Home Assistant with their entities."
         }
       }
     }
@@ -97,6 +115,11 @@
       "humidity": {
         "name": "Humidity"
       }
+    }
+  },
+  "exceptions": {
+    "downlink_failed": {
+      "message": "The gateway did not accept the command for the device: {error}"
     }
   }
 }

@@ -12,16 +12,25 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 
 from .const import CONF_GATEWAY_URL, DOMAIN
-from .coordinator import MilesightGatewayCoordinator
+from .coordinator import MilesightDiagnosticsCoordinator, MilesightGatewayCoordinator
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.device_registry import DeviceEntry
-    from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR]
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CLIMATE,
+    Platform.EVENT,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
 # Bumped when entry data or the registry layout changes; see
 # async_migrate_entry and ConfigFlow.MINOR_VERSION.
@@ -35,8 +44,9 @@ type MilesightGatewayConfigEntry = ConfigEntry[RuntimeData]
 class RuntimeData:
     """Runtime data stored on the config entry."""
 
-    coordinator: DataUpdateCoordinator
+    coordinator: MilesightGatewayCoordinator
     gateway_device_id: str
+    diagnostics: MilesightDiagnosticsCoordinator
 
 
 async def async_migrate_entry(
@@ -61,6 +71,33 @@ async def async_migrate_entry(
         hass.config_entries.async_update_entry(entry, minor_version=ENTRY_MINOR_VERSION)
 
     return True
+
+
+def _remove_deselected_devices(
+    hass: HomeAssistant,
+    entry: MilesightGatewayConfigEntry,
+    coordinator: MilesightGatewayCoordinator,
+) -> None:
+    """
+    Drop the devices a device selection leaves out, with their entities.
+
+    Only devices the gateway lists and the user did not pick: a device that is
+    merely offline keeps its history and comes back when it returns.
+    """
+    selected = {device.dev_eui for device in coordinator.data.devices}
+    left_out = {
+        device.dev_eui
+        for device in coordinator.data.matched
+        if device.dev_eui not in selected
+    }
+    registry = dr.async_get(hass)
+    for eui in left_out:
+        if device := registry.async_get_device_by_identifier(
+            (DOMAIN, eui), entry.entry_id
+        ):
+            registry.async_update_device(
+                device.id, remove_config_entry_id=entry.entry_id
+            )
 
 
 async def async_setup_entry(
@@ -88,7 +125,13 @@ async def async_setup_entry(
         configuration_url=gateway_url,
     )
 
-    entry.runtime_data = RuntimeData(coordinator, gateway_device.id)
+    _remove_deselected_devices(hass, entry, coordinator)
+
+    # Not a first refresh: the status calls must not stop the devices loading.
+    diagnostics = MilesightDiagnosticsCoordinator(hass, entry, coordinator.api)
+    await diagnostics.async_refresh()
+
+    entry.runtime_data = RuntimeData(coordinator, gateway_device.id, diagnostics)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 

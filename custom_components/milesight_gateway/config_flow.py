@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 import voluptuous as vol
 from homeassistant.config_entries import (
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlowWithReload,
@@ -21,18 +22,30 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from homeassistant.config_entries import ConfigEntry
 
+    from .api import MilesightDevice
+
 from .api import APIAuthError, APIConnectionError, MilesightGatewayAPI
 from .const import (
+    CONF_DEVICES,
+    CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
     CONF_GATEWAY_URL,
     CONF_IV,
     CONF_SECRET_KEY,
+    CONF_STATUS_INTERVAL,
+    CONF_WEB_DATA,
     DEFAULT_GATEWAY_MQTT_BASE_TOPIC,
     DEFAULT_IV,
     DEFAULT_PORT,
@@ -41,6 +54,7 @@ from .const import (
     DOMAIN,
     MIN_SCAN_INTERVAL,
 )
+from .coordinator import status_interval
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -130,7 +144,30 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     except APIConnectionError as err:
         raise CannotConnectError from err
 
-    return {"title": data[CONF_GATEWAY_URL]}
+    return {"title": data[CONF_GATEWAY_URL], "api": api}
+
+
+def device_choices(devices: list[MilesightDevice]) -> list[SelectOptionDict]:
+    """Label each device so the list can be searched by name, model and EUI."""
+    return [
+        SelectOptionDict(
+            value=device.dev_eui,
+            label=f"{device.name} · {device.model_id} · {device.dev_eui}",
+        )
+        for device in devices
+    ]
+
+
+def device_selector(choices: list[SelectOptionDict]) -> SelectSelector:
+    """Return the searchable multi-select for the device choice."""
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=choices,
+            multiple=True,
+            mode=SelectSelectorMode.DROPDOWN,
+            sort=True,
+        )
+    )
 
 
 class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -138,6 +175,11 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
     MINOR_VERSION = 2
+
+    def __init__(self) -> None:
+        """Hold the first step's input until the devices are chosen."""
+        self._data: dict[str, Any] = {}
+        self._choices: list[SelectOptionDict] = []
 
     @staticmethod
     @callback
@@ -172,11 +214,53 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                 unique_id = f"{user_input[CONF_GATEWAY_URL]}:{user_input[CONF_PORT]}"
                 await self.async_set_unique_id(unique_id)
                 self._abort_if_unique_id_configured()
-                return self.async_create_entry(title=info["title"], data=user_input)
+                self._data = user_input
+                self._choices = await self._async_list_devices(info["api"])
+                if not self._choices:
+                    return self.async_create_entry(title=info["title"], data=user_input)
+                return await self.async_step_devices()
 
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
+
+    async def async_step_devices(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """
+        Let the user pick devices before any entity is created.
+
+        On a network with hundreds of sensors this is the only point where
+        picking avoids creating them all first.
+        """
+        if user_input is not None:
+            return self.async_create_entry(
+                title=self._data[CONF_GATEWAY_URL],
+                data=self._data,
+                options={CONF_DEVICES: user_input.get(CONF_DEVICES, [])},
+            )
+        return self.async_show_form(
+            step_id="devices",
+            data_schema=vol.Schema(
+                {vol.Optional(CONF_DEVICES, default=[]): device_selector(self._choices)}
+            ),
+            description_placeholders={"count": str(len(self._choices))},
+        )
+
+    async def _async_list_devices(
+        self, api: MilesightGatewayAPI
+    ) -> list[SelectOptionDict]:
+        """List the gateway's devices; none when the list cannot be read."""
+        try:
+            devices, _, _ = await api.async_get_devices(
+                async_get_clientsession(self.hass)
+            )
+        except (APIAuthError, APIConnectionError) as err:
+            # Not worth failing the setup over: without a list, all devices
+            # are taken, and the options can narrow them down later.
+            _LOGGER.debug("Cannot list the devices for the choice: %s", err)
+            return []
+        return device_choices(devices)
 
     async def async_step_reauth(
         self, _entry_data: Mapping[str, Any]
@@ -291,22 +375,63 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
+        choices = self._device_choices()
         if user_input is not None:
+            if choices is not None:
+                # An emptied selection may arrive as a missing key; without
+                # this the merge below would keep the old selection.
+                user_input.setdefault(CONF_DEVICES, [])
             return self.async_create_entry(data=self.config_entry.options | user_input)
 
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_SCAN_INTERVAL,
-                        default=self.config_entry.options.get(
-                            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-                        ),
-                    ): vol.All(vol.Coerce(int), vol.Clamp(min=MIN_SCAN_INTERVAL)),
-                }
-            ),
+        options = self.config_entry.options
+        schema: dict[Any, Any] = {
+            vol.Required(
+                CONF_SCAN_INTERVAL,
+                default=options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            ): vol.All(vol.Coerce(int), vol.Clamp(min=MIN_SCAN_INTERVAL)),
+            vol.Required(
+                CONF_STATUS_INTERVAL, default=status_interval(options)
+            ): vol.All(vol.Coerce(int), vol.Clamp(min=MIN_SCAN_INTERVAL)),
+            vol.Required(CONF_WEB_DATA, default=options.get(CONF_WEB_DATA, True)): bool,
+            vol.Required(
+                CONF_FIRMWARE_CHECK,
+                default=options.get(CONF_FIRMWARE_CHECK, True),
+            ): bool,
+        }
+        # The choice needs the gateway's device list, so it is only offered
+        # while the entry is loaded; a stored selection stays as it is.
+        if choices is not None:
+            # A suggestion, not a default: a default would be filled back in
+            # when the emptied field is left out, so "all" could not be chosen.
+            schema[
+                vol.Optional(
+                    CONF_DEVICES,
+                    description={
+                        "suggested_value": list(options.get(CONF_DEVICES, []))
+                    },
+                )
+            ] = device_selector(choices)
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))
+
+    def _device_choices(self) -> list[SelectOptionDict] | None:
+        """List the gateway's devices to pick from, or None when unknown."""
+        entry = self.config_entry
+        runtime = getattr(entry, "runtime_data", None)
+        if entry.state is not ConfigEntryState.LOADED or runtime is None:
+            return None
+        data = runtime.coordinator.data
+        if data is None:
+            return None
+        choices = device_choices(data.matched)
+        # A picked device the gateway no longer lists stays choosable, so
+        # saving the form does not fail on it and it can be removed.
+        listed = {device.dev_eui for device in data.matched}
+        choices.extend(
+            SelectOptionDict(value=eui, label=eui)
+            for eui in entry.options.get(CONF_DEVICES, [])
+            if eui not in listed
         )
+        return choices
 
 
 class CannotConnectError(HomeAssistantError):

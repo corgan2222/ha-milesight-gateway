@@ -27,7 +27,7 @@ from custom_components.milesight_gateway.api import (
 
 
 def _request_info() -> RequestInfo:
-    url = URL("https://192.168.2.180:8080/api/internal/login")
+    url = URL("https://192.0.2.10:8080/api/internal/login")
     return RequestInfo(url=url, method="POST", headers=MagicMock(), real_url=url)
 
 
@@ -46,7 +46,7 @@ def _api(client: MagicMock) -> MilesightGatewayAPI:
         return_value=client,
     ):
         return MilesightGatewayAPI(
-            gateway_url="https://192.168.2.180",
+            gateway_url="https://192.0.2.10",
             port=8080,
             username="admin",
             password="secret",  # noqa: S106
@@ -170,6 +170,14 @@ async def test_credentials_that_stay_rejected_surface_as_an_auth_error():
         await api.async_get_devices(MagicMock())
 
     assert client.get_all_devices.await_count == 2
+
+
+async def test_the_device_list_is_read_in_one_request():
+    """Paging is no snapshot on a busy gateway, so the whole list is asked for."""
+    client = _ok_client([])
+    await _api(client).async_get_devices(MagicMock())
+
+    assert client.get_all_devices.await_args.kwargs["limit"] >= 10000
 
 
 async def test_a_gateway_with_no_devices_is_not_an_error():

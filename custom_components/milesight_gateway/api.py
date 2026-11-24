@@ -14,11 +14,18 @@ import logging
 import pathlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import ClientError, ClientResponseError, ContentTypeError
-from milesight_gateway_api.milesight_gateway_client import MilesightGatewayClient
+from milesight_gateway_api import (
+    FirmwareRelease,
+    MilesightGatewayClient,
+    MilesightGatewayError,
+    WebLoginRefusedError,
+    get_latest_firmware,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -86,6 +93,16 @@ ENTITY_MAPPING: dict[str, dict[str, Any] | list[dict[str, Any]]] = {
         "unit": "dB",
         "name": "LoRa SNR",
     },
+    # Devices on a default codec get the gateway template's key instead.
+    "snr": {
+        "platform": "sensor",
+        "icon": "mdi:signal",
+        "enabled_by_default": True,
+        "entity_category": "diagnostic",
+        "state_class": "measurement",
+        "unit": "dB",
+        "name": "LoRa SNR",
+    },
     "occupancy": {
         "platform": "binary_sensor",
         "device_class": "occupancy",
@@ -137,6 +154,46 @@ ENTITY_MAPPING: dict[str, dict[str, Any] | list[dict[str, Any]]] = {
         "enabled_by_default": True,
         "entity_category": "diagnostic",
     },
+    # WT101 reports 0 = installed, 1 = uninstalled; above zero reads as on.
+    "tamper_status": {
+        "platform": "binary_sensor",
+        "device_class": "tamper",
+        "enabled_by_default": True,
+        "entity_category": "diagnostic",
+        "name": "Tamper",
+    },
+    "window_detection": {
+        "platform": "binary_sensor",
+        "device_class": "window",
+        "enabled_by_default": True,
+        "name": "Window open",
+    },
+    "valve_opening": {
+        "platform": "sensor",
+        "icon": "mdi:pipe-valve",
+        "state_class": "measurement",
+        "enabled_by_default": True,
+        "unit": "%",
+        "name": "Valve opening",
+    },
+    # Stateless press events; the event platform maps the payload values.
+    "button": {
+        "platform": "event",
+        "enabled_by_default": True,
+        "name": "Button",
+    },
+    "button_event": {
+        "platform": "event",
+        "enabled_by_default": True,
+        "name": "Button",
+    },
+    # Marks the device as a thermostat; the climate platform reads the
+    # temperature keys itself and writes settings as downlinks.
+    "target_temperature": {
+        "platform": "climate",
+        "enabled_by_default": True,
+        "name": "Thermostat",
+    },
     "sn": {
         "platform": "sensor",
         "enabled_by_default": False,
@@ -186,7 +243,7 @@ class EntityDefinition:
 
     key: str
     name: str
-    platform: str  # "sensor" or "binary_sensor"
+    platform: str  # "sensor", "binary_sensor", "event" or "climate"
     unit: str | None = None
     device_class: str | None = None
     state_class: str | None = None
@@ -315,6 +372,166 @@ def _build_device(
     )
 
 
+@dataclass(frozen=True)
+class GatewayInfo:
+    """What the gateway reports about itself without a login."""
+
+    model: str | None
+    firmware: str
+
+
+@dataclass(frozen=True)
+class GatewayDetails:
+    """What the gateway's web interface reports after a login."""
+
+    model_id: str | None
+    serial_number: str | None
+    hw_version: str | None
+
+
+@dataclass(frozen=True)
+class SystemStatus:
+    """Load and resources the web interface reports."""
+
+    cpu_load: float | None
+    memory_available: float | None
+    storage_available: float | None
+    uptime: int | None
+
+
+@dataclass(frozen=True)
+class FleetGateway:
+    """A gateway the network server receives packets from."""
+
+    eui: str
+    name: str
+    connected: bool | None
+    # The gateway reports its local time without a zone.
+    last_seen: datetime | None
+
+
+@dataclass(frozen=True)
+class ApplicationLink:
+    """The MQTT link of an application that has devices."""
+
+    app_id: str
+    name: str
+    host: str | None
+    connected: bool | None
+
+
+@dataclass(frozen=True)
+class Packet:
+    """One packet from the network server's packet log."""
+
+    key: tuple[str, ...]
+    time: datetime
+    dev_eui: str
+    uplink: bool
+    spread_factor: int | None
+    frequency: int | None
+
+
+@dataclass(frozen=True)
+class NetworkStatus:
+    """What the network server reports about itself and its gateways."""
+
+    gateway_eui: str | None
+    forwarder_connected: bool | None
+    pending_packets: int | None
+    gateways: list[FleetGateway]
+    links: list[ApplicationLink]
+    application_count: int | None
+    codec_count: int | None
+    profile_count: int | None
+    codec_library_version: str | None
+    packets: list[Packet]
+
+
+# The packet log keeps the last 1000 packets; this many newest ones are read
+# per refresh, which covers several minutes of a busy network.
+PACKET_WINDOW = 300
+# The whole device list in one request. Paging by offset is no snapshot: on a
+# busy network the gateway reorders the list between requests, and per full
+# read 11 to 24 of 646 devices fell between pages (UG65 fleet, 2026-11-24), so
+# their entities flickered unavailable. One page of 646 took 15 to 20 s there.
+DEVICE_PAGE_SIZE = 10000
+# connectStatus of an MQTT link, as the web interface labels it.
+_MQTT_CONNECTED = 3
+
+
+def _items(value: Any) -> list[dict[str, Any]]:
+    """Return the dicts of a list the API reports, ignoring anything else."""
+    return (
+        [item for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def _int(value: Any) -> int | None:
+    """Return a count the API reports as a number or a numeric string."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except TypeError, ValueError:
+        return None
+
+
+def _percent(value: Any) -> float | None:
+    """Return a percentage the web interface reports as text, such as "25.20%"."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(value.strip().rstrip("%"))
+    except ValueError:
+        return None
+
+
+def _local_time(value: Any) -> datetime | None:
+    """Parse a "YYYY-MM-DD HH:MM:SS" time, which the gateway gives without zone."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")  # noqa: DTZ007
+    except ValueError:
+        return None
+
+
+def _packet(raw: dict[str, Any]) -> Packet | None:
+    """Return a packet log entry, or None if it lacks a time or device."""
+    try:
+        time = datetime.fromisoformat(str(raw.get("time")))
+    except ValueError:
+        return None
+    dev_eui = raw.get("devEUI")
+    kind = str(raw.get("type", ""))
+    if not isinstance(dev_eui, str) or not dev_eui or time.tzinfo is None:
+        return None
+    return Packet(
+        key=(str(raw.get("time")), dev_eui, str(raw.get("fCnt")), kind),
+        time=time,
+        dev_eui=dev_eui.lower(),
+        uplink=kind.startswith("Up"),
+        spread_factor=_int(raw.get("spreadFactor")),
+        frequency=_int(raw.get("frequency")),
+    )
+
+
+def _text(value: Any) -> str | None:
+    """Return a reported text, or None for a missing or placeholder value."""
+    return value if isinstance(value, str) and value not in ("", "-") else None
+
+
+async def async_get_latest_firmware(
+    session: ClientSession, family: str
+) -> FirmwareRelease | None:
+    """Return the newest release of ``family`` from Milesight's download page."""
+    with _as_api_error():
+        return await get_latest_firmware(session, family)
+
+
 class APIAuthError(Exception):
     """Raised when authentication with the gateway fails."""
 
@@ -328,6 +545,12 @@ def _as_api_error() -> Iterator[None]:
     """Translate the client's exceptions into this integration's two types."""
     try:
         yield
+    except WebLoginRefusedError as err:
+        msg = "Gateway refused the web interface login"
+        raise APIAuthError(msg) from err
+    except MilesightGatewayError as err:
+        msg = f"Unexpected answer from gateway: {err}"
+        raise APIConnectionError(msg) from err
     except ContentTypeError as err:
         # Subclasses ClientResponseError, so it must be caught first; its
         # .status is the real status (usually 200), not an auth code.
@@ -389,6 +612,15 @@ class MilesightGatewayAPI:
             port=port,
         )
 
+    @property
+    def web_login_refused(self) -> bool:
+        """Whether the web interface refused the login; it is not tried again."""
+        return self._client.web_login_refused
+
+    @web_login_refused.setter
+    def web_login_refused(self, refused: bool) -> None:
+        self._client.web_login_refused = refused
+
     async def async_connect(self, session: ClientSession) -> bool:
         """Authenticate and obtain a JWT token from the gateway."""
         self._devices_db = await asyncio.to_thread(_load_devices_db)
@@ -406,10 +638,181 @@ class MilesightGatewayAPI:
         self.connected = True
         return True
 
+    async def async_get_gateway_info(self, session: ClientSession) -> GatewayInfo:
+        """
+        Return the gateway's model and firmware version.
+
+        The web interface's login check answers without a session and carries
+        both, while the network server API has no call for either.
+        """
+        with _as_api_error():
+            payload = await self._client.get_login_status(session)
+        version = payload.get("rtver")
+        if not isinstance(version, str) or not version:
+            msg = "Gateway did not report a firmware version"
+            raise APIConnectionError(msg)
+        return GatewayInfo(model=_text(payload.get("model")), firmware=version)
+
+    async def async_get_gateway_details(self, session: ClientSession) -> GatewayDetails:
+        """Return the gateway's model number, serial number and hardware version."""
+        system = await self._async_web_system(session)
+        return GatewayDetails(
+            model_id=_text(system.get("model")),
+            serial_number=_text(system.get("sn")),
+            hw_version=_text(system.get("hardware_ver")),
+        )
+
+    async def async_get_system_status(self, session: ClientSession) -> SystemStatus:
+        """Return CPU load, free memory and storage, and uptime."""
+        system = await self._async_web_system(session)
+        uptime = system.get("uptime")
+        return SystemStatus(
+            cpu_load=_percent(system.get("cpu_load")),
+            memory_available=_percent(system.get("memory_avail_percent")),
+            storage_available=_percent(system.get("emmc_avail_percent")),
+            uptime=uptime if isinstance(uptime, int) and uptime >= 0 else None,
+        )
+
+    async def _async_web_system(self, session: ClientSession) -> dict[str, Any]:
+        """
+        Return the system block of the web interface's status summary.
+
+        The client stops logging in after one refusal, because the gateway
+        locks an account after a few failed web logins. The refusal is logged
+        once, when it happens.
+        """
+        refused_before = self._client.web_login_refused
+        try:
+            with _as_api_error():
+                return await self._client.get_system_info(session)
+        except APIAuthError:
+            if self._client.web_login_refused and not refused_before:
+                _LOGGER.warning(
+                    "The gateway's web interface refused the configured account, "
+                    "so its system status and serial number are not shown. Not "
+                    "retried until the integration is reloaded, so the account is "
+                    "not locked"
+                )
+            raise
+
+    async def async_get_network_status(self, session: ClientSession) -> NetworkStatus:
+        """Return what the network server reports about itself and its gateways."""
+        try:
+            return await self._async_network_status(session)
+        except APIAuthError:
+            # An expired JWT looks like a bad password; log in once more.
+            await self.async_connect(session)
+            return await self._async_network_status(session)
+
+    async def _async_network_status(self, session: ClientSession) -> NetworkStatus:
+        """Read the network server's status calls."""
+        client = self._client
+        with _as_api_error():
+            forwarder, _ = await client.get_packet_forwarder_info(session)
+            gateways = await client.get_gateways(session)
+            apps = await client.get_applications(session)
+            _, codec_count = await client.get_payload_codecs_short(session)
+            codec_setting = await client.get_payload_codec_settings(session)
+            _, profile_count = await client.get_profiles(session, "0")
+            packets = await client.get_packets(session, PACKET_WINDOW)
+
+        links = []
+        for app in _items(apps.get("result")):
+            # Only applications with devices forward anything; the others are
+            # configured but idle and their link status means nothing.
+            if not app.get("using") or "URMQTT" not in (app.get("kinds") or []):
+                continue
+            with _as_api_error():
+                mqtt = await client.get_data_transmission_integration(
+                    session, app.get("id"), "mqtt"
+                )
+            if not isinstance(mqtt, dict):
+                msg = f"Unexpected MQTT settings of application {app.get('id')}"
+                raise APIConnectionError(msg)
+            status = mqtt.get("connectStatus")
+            links.append(
+                ApplicationLink(
+                    app_id=str(app.get("id")),
+                    name=_text(app.get("name")) or f"Application {app.get('id')}",
+                    host=_text(mqtt.get("host")),
+                    connected=status == _MQTT_CONNECTED
+                    if isinstance(status, int)
+                    else None,
+                )
+            )
+
+        return NetworkStatus(
+            gateway_eui=_text(forwarder.get("gatewayEui")),
+            forwarder_connected=forwarder.get("status") == 1
+            if "status" in forwarder
+            else None,
+            pending_packets=_int(forwarder.get("pendingData")),
+            gateways=[
+                FleetGateway(
+                    eui=str(gw.get("mac")),
+                    name=_text(gw.get("name")) or str(gw.get("mac")),
+                    connected=gw.get("connected")
+                    if isinstance(gw.get("connected"), bool)
+                    else None,
+                    last_seen=_local_time(gw.get("lastSeenAt")),
+                )
+                for gw in _items(gateways.get("result"))
+                if gw.get("mac")
+            ],
+            links=links,
+            application_count=_int(apps.get("totalCount")),
+            codec_count=_int(codec_count),
+            profile_count=_int(profile_count),
+            codec_library_version=_text(codec_setting.get("version")),
+            packets=[
+                p
+                for p in (_packet(raw) for raw in _items(packets.get("packets")))
+                if p is not None
+            ],
+        )
+
+    async def async_enqueue_downlink(
+        self,
+        session: ClientSession,
+        dev_eui: str,
+        command: dict[str, Any],
+        *,
+        fport: int = 85,
+        confirmed: bool = False,
+    ) -> None:
+        """Queue a downlink; the gateway delivers it after the next uplink."""
+        try:
+            await self._async_post_downlink(
+                session, dev_eui, command, fport=fport, confirmed=confirmed
+            )
+        except APIAuthError:
+            # An expired JWT looks like bad credentials; log in once more.
+            await self.async_connect(session)
+            await self._async_post_downlink(
+                session, dev_eui, command, fport=fport, confirmed=confirmed
+            )
+
+    async def _async_post_downlink(
+        self,
+        session: ClientSession,
+        dev_eui: str,
+        command: dict[str, Any],
+        *,
+        fport: int,
+        confirmed: bool,
+    ) -> None:
+        """Hand one queue item to the client, translating any failure."""
+        with _as_api_error():
+            await self._client.enqueue_downlink(
+                session, dev_eui, command, fport=fport, confirmed=confirmed
+            )
+
     async def _fetch_devices(self, session: ClientSession) -> list[dict]:
         """Fetch the raw device list, translating any failure."""
         with _as_api_error():
-            all_devices, _ = await self._client.get_all_devices(session)
+            all_devices, _ = await self._client.get_all_devices(
+                session, limit=DEVICE_PAGE_SIZE
+            )
         return all_devices
 
     async def async_get_devices(

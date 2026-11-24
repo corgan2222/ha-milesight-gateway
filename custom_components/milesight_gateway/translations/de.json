@@ -6,14 +6,24 @@
       "reauth_successful": "Neue Anmeldung war erfolgreich"
     },
     "error": {
-      "missing_scheme": "Die URL muss mit http:// oder https:// beginnen, zum Beispiel https://192.168.2.180.",
+      "missing_scheme": "Die URL muss mit http:// oder https:// beginnen, zum Beispiel https://192.0.2.10.",
       "url_with_port": "Den Port nicht in die URL schreiben, sondern ins Feld Port eintragen.",
-      "invalid_url": "Nur die Adresse des Gateways eingeben, zum Beispiel https://192.168.2.180, ohne Pfad oder Benutzernamen.",
+      "invalid_url": "Nur die Adresse des Gateways eingeben, zum Beispiel https://192.0.2.10, ohne Pfad oder Benutzernamen.",
       "cannot_connect": "Verbindung fehlgeschlagen",
       "invalid_auth": "Ungültige Authentifizierung",
       "unknown": "Unerwarteter Fehler"
     },
     "step": {
+      "devices": {
+        "title": "Geräte auswählen",
+        "description": "Das Gateway kennt {count} Geräte mit bekanntem Modell. Wählen Sie die aus, die in Home Assistant Entities bekommen sollen, oder lassen Sie die Liste leer für alle.",
+        "data": {
+          "devices": "Geräte"
+        },
+        "data_description": {
+          "devices": "Durchsuchbar nach Name, Modell und devEUI. Die Auswahl lässt sich später in den Optionen ändern."
+        }
+      },
       "user": {
         "title": "Milesight Gateway konfigurieren",
         "description": "Geben Sie die Verbindungsdetails für Ihr Milesight Gateway ein.",
@@ -27,7 +37,7 @@
           "gateway_mqtt_base_topic": "MQTT-Uplink-Basistopic"
         },
         "data_description": {
-          "gateway_url": "Die URL deines Milesight-Gateways mit http:// oder https://, aber ohne Port, zum Beispiel `https://192.168.2.180`.",
+          "gateway_url": "Die URL deines Milesight-Gateways mit http:// oder https://, aber ohne Port, zum Beispiel `https://192.0.2.10`.",
           "port": "Der Port der Gateway-API.",
           "username": "Der Benutzername für die Anmeldung am Milesight Gateway.",
           "password": "Das Passwort für die Anmeldung am Milesight Gateway.",
@@ -65,7 +75,7 @@
           "gateway_mqtt_base_topic": "MQTT-Uplink-Basistopic"
         },
         "data_description": {
-          "gateway_url": "Die URL deines Milesight-Gateways mit http:// oder https://, aber ohne Port, zum Beispiel `https://192.168.2.180`. Hier ändern, wenn das Gateway eine andere Adresse bekommen hat.",
+          "gateway_url": "Die URL deines Milesight-Gateways mit http:// oder https://, aber ohne Port, zum Beispiel `https://192.0.2.10`. Hier ändern, wenn das Gateway eine andere Adresse bekommen hat.",
           "port": "Der Port der Gateway-API.",
           "username": "Der Benutzername für die Anmeldung am Milesight Gateway.",
           "password": "Das neue Passwort für die Anmeldung am Milesight Gateway.",
@@ -81,10 +91,18 @@
       "init": {
         "title": "Milesight Gateway Optionen",
         "data": {
-          "scan_interval": "Abfrageintervall (Sekunden)"
+          "scan_interval": "Abfrageintervall (Sekunden)",
+          "status_interval": "Statusintervall (Sekunden)",
+          "web_data": "Weboberfläche abfragen",
+          "firmware_check": "Nach neuer Firmware suchen",
+          "devices": "Geräte"
         },
         "data_description": {
-          "scan_interval": "Wie oft das Gateway nach aktuellen Sensordaten abgefragt werden soll."
+          "scan_interval": "Wie oft die Geräteliste vom Gateway gelesen wird. Sensorwerte kommen per MQTT, sobald sie gesendet werden.",
+          "status_interval": "Wie oft der Status des Gateways gelesen wird: Verbindungen, Pakete, CPU und Speicher.",
+          "web_data": "Meldet sich an der Weboberfläche des Gateways an, für Seriennummer, CPU-Last, Arbeitsspeicher, Speicherplatz und Laufzeit. Nutzt dasselbe Konto.",
+          "firmware_check": "Sucht zweimal am Tag auf milesight.com nach der neuesten Gateway-Firmware.",
+          "devices": "Nur diese Geräte bekommen Entities. Leer lassen für alle Geräte. Was Sie aus der Liste nehmen, verschwindet mit seinen Entities aus Home Assistant."
         }
       }
     }
@@ -97,6 +115,11 @@
       "humidity": {
         "name": "Luftfeuchtigkeit"
       }
+    }
+  },
+  "exceptions": {
+    "downlink_failed": {
+      "message": "Das Gateway hat den Befehl für das Gerät nicht angenommen: {error}"
     }
   }
 }

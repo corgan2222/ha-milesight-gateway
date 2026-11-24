@@ -7,19 +7,48 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.mqtt import async_subscribe
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .api import APIAuthError, APIConnectionError
 from .const import DOMAIN
 from .coordinator import MilesightGatewayCoordinator
 
 if TYPE_CHECKING:
     from homeassistant.components.mqtt.models import ReceiveMessage
 
-    from .api import MilesightDevice
+    from .api import FleetGateway, MilesightDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@callback
+def remove_switched_off_entity(
+    hass: HomeAssistant, platform: str, unique_id: str
+) -> None:
+    """Drop an entity an option switched off, instead of leaving it orphaned."""
+    registry = er.async_get(hass)
+    if entity_id := registry.async_get_entity_id(platform, DOMAIN, unique_id):
+        registry.async_remove(entity_id)
+
+
+def fleet_device_info(
+    gateway: FleetGateway, entry_id: str, gateway_id: str, *, local: bool
+) -> DeviceInfo:
+    """Return the device of a fleet gateway; the local one is the gateway device."""
+    if local:
+        return DeviceInfo(identifiers={(DOMAIN, entry_id)})
+    return DeviceInfo(
+        identifiers={(DOMAIN, gateway.eui)},
+        name=gateway.name,
+        model="LoRaWAN Gateway",
+        serial_number=gateway.eui,
+        via_device_id=gateway_id,
+    )
 
 
 class MilesightDeviceEntity(CoordinatorEntity[MilesightGatewayCoordinator]):
@@ -77,6 +106,10 @@ class MilesightDeviceEntity(CoordinatorEntity[MilesightGatewayCoordinator]):
 
     def _read_value(self, msg: ReceiveMessage, key: str) -> Any:
         """Return ``key`` from the message's JSON payload, or None."""
+        return self._read_path(msg, (key,))
+
+    def _read_path(self, msg: ReceiveMessage, path: tuple[str, ...]) -> Any:
+        """Walk ``path`` through the payload's nested objects, or None."""
         try:
             payload = json.loads(msg.payload)
         except ValueError:
@@ -89,4 +122,30 @@ class MilesightDeviceEntity(CoordinatorEntity[MilesightGatewayCoordinator]):
                 "Unexpected payload on topic %s: %s", self._data_topic, msg.payload
             )
             return None
-        return payload.get(key)
+        value: Any = payload
+        for key in path:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(key)
+        return value
+
+    async def _async_send_downlink(self, command: dict[str, Any]) -> None:
+        """Queue a downlink; a failure reaches the user as a readable error."""
+        try:
+            await self.coordinator.api.async_enqueue_downlink(
+                async_get_clientsession(self.hass), self._dev_eui, command
+            )
+        except (APIAuthError, APIConnectionError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="downlink_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err
+
+
+def nested_command(path: tuple[str, ...], value: Any) -> dict[str, Any]:
+    """Build the downlink command the codec expects for a payload path."""
+    command: Any = value
+    for key in reversed(path):
+        command = {key: command}
+    return command
