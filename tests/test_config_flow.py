@@ -27,6 +27,8 @@ from custom_components.milesight_gateway.api import (
     _build_device,
 )
 from custom_components.milesight_gateway.const import (
+    CONF_ALL_SETTINGS,
+    CONF_DATA_SOURCE,
     CONF_DEVICES,
     CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
@@ -36,6 +38,8 @@ from custom_components.milesight_gateway.const import (
     CONF_STATUS_INTERVAL,
     CONF_WEB_DATA,
     DOMAIN,
+    SOURCE_LORAWAN,
+    SOURCE_MQTT,
 )
 
 USER_INPUT = {
@@ -98,7 +102,7 @@ def _entry(**overrides) -> MockConfigEntry:
 
 
 async def test_user_flow_creates_entry(hass, mock_setup_entry):
-    """A valid submission creates an entry titled after the gateway URL."""
+    """A valid submission, then the data source, creates the entry."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
@@ -109,11 +113,18 @@ async def test_user_flow_creates_entry(hass, mock_setup_entry):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], USER_INPUT
         )
-        await hass.async_block_till_done()
+    # No device list to pick from: the step asks for the data source only.
+    assert result["step_id"] == "devices"
+    assert [str(key) for key in result["data_schema"].schema] == [CONF_DATA_SOURCE]
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "https://192.0.2.10"
     assert result["data"] == USER_INPUT
+    # New entries default to the LoRaWAN source.
+    assert result["options"] == {CONF_DATA_SOURCE: SOURCE_LORAWAN, CONF_DEVICES: []}
     assert result["result"].unique_id == "https://192.0.2.10:8080"
 
 
@@ -125,6 +136,14 @@ async def _submit_credentials(hass) -> dict:
         return await hass.config_entries.flow.async_configure(
             result["flow_id"], USER_INPUT
         )
+
+
+async def _finish(hass, result: dict) -> dict:
+    """Accept the second step's defaults: the data source, all devices."""
+    assert result["step_id"] == "devices"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    await hass.async_block_till_done()
+    return result
 
 
 @pytest.mark.parametrize(
@@ -148,19 +167,31 @@ async def test_devices_are_chosen_before_the_entry_exists(
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == USER_INPUT
-    assert result["options"] == {CONF_DEVICES: stored}
+    assert result["options"] == {CONF_DATA_SOURCE: SOURCE_LORAWAN, CONF_DEVICES: stored}
 
 
 async def test_an_unreadable_device_list_skips_the_choice(
     hass, mock_setup_entry, device_list
 ):
-    """Without a list the entry takes all devices instead of failing."""
+    """Without a list only the data source is asked; all devices are taken."""
     device_list.side_effect = APIConnectionError("down")
 
     result = await _submit_credentials(hass)
+    assert [str(key) for key in result["data_schema"].schema] == [CONF_DATA_SOURCE]
+    result = await _finish(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["options"] == {}
+    assert result["options"] == {CONF_DATA_SOURCE: SOURCE_LORAWAN, CONF_DEVICES: []}
+
+
+async def test_the_mqtt_source_can_be_chosen_at_setup(hass, mock_setup_entry):
+    """Who keeps a broker running can stay on MQTT from the start."""
+    result = await _submit_credentials(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_DATA_SOURCE: SOURCE_MQTT}
+    )
+
+    assert result["options"][CONF_DATA_SOURCE] == SOURCE_MQTT
 
 
 @pytest.mark.parametrize(
@@ -191,7 +222,7 @@ async def test_user_flow_errors_then_recovers(
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], USER_INPUT
         )
-        await hass.async_block_till_done()
+    result = await _finish(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
@@ -374,7 +405,7 @@ async def test_options_flow_sets_scan_interval(hass):
 
 
 async def test_options_flow_sets_status_and_sources(hass):
-    """The status interval and both outside sources can be set."""
+    """The status interval, the outside sources and the data source can be set."""
     entry = _entry()
     entry.add_to_hass(hass)
     options = {
@@ -382,6 +413,8 @@ async def test_options_flow_sets_status_and_sources(hass):
         CONF_STATUS_INTERVAL: 90,
         CONF_WEB_DATA: False,
         CONF_FIRMWARE_CHECK: False,
+        CONF_DATA_SOURCE: SOURCE_LORAWAN,
+        CONF_ALL_SETTINGS: True,
     }
 
     with patch(
@@ -598,7 +631,7 @@ async def test_user_flow_normalizes_the_url(hass, mock_setup_entry, typed):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
         )
-        await hass.async_block_till_done()
+    result = await _finish(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_GATEWAY_URL] == "https://192.0.2.10"
@@ -660,7 +693,7 @@ async def test_user_flow_explains_an_unusable_url(
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], USER_INPUT
         )
-        await hass.async_block_till_done()
+        result = await _finish(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
@@ -675,7 +708,7 @@ async def test_user_flow_accepts_http_and_host_names(hass, mock_setup_entry, typ
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
         )
-        await hass.async_block_till_done()
+        result = await _finish(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_GATEWAY_URL] == typed

@@ -1,6 +1,12 @@
 """Constants for the Milesight Gateway integration."""
 
+from __future__ import annotations
+
 from datetime import timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 DOMAIN = "milesight_gateway"
 
@@ -23,3 +29,16 @@ CONF_STATUS_INTERVAL = "status_interval"
 CONF_WEB_DATA = "web_data"
 CONF_FIRMWARE_CHECK = "firmware_check"
 CONF_DEVICES = "devices"
+# Where sensor data comes from. Entries from before the option read MQTT, so an
+# update changes nothing until the user switches.
+CONF_DATA_SOURCE = "data_source"
+SOURCE_MQTT = "mqtt"
+SOURCE_LORAWAN = "lorawan"
+# LoRaWAN source: an entity for every setting and command, not only the
+# essential ones.
+CONF_ALL_SETTINGS = "all_settings"
+
+
+def data_source(options: Mapping[str, Any]) -> str:
+    """Return the entry's data source; MQTT when the option is absent."""
+    return options.get(CONF_DATA_SOURCE) or SOURCE_MQTT

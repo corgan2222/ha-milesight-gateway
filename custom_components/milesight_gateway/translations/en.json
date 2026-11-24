@@ -16,9 +16,11 @@
         "step": {
             "devices": {
                 "data": {
+                    "data_source": "Data source",
                     "devices": "Devices"
                 },
                 "data_description": {
+                    "data_source": "Where sensor values come from. LoRaWAN reads the gateway's packet log and decodes with Milesight's own codecs; no MQTT broker needed. MQTT takes what the gateway publishes, decoded by the codecs set up on the gateway.",
                     "devices": "Searchable by name, model and devEUI. You can change the choice later in the options."
                 },
                 "description": "The gateway lists {count} devices with a known model. Pick the ones that should get entities in Home Assistant, or leave the list empty for all of them.",
@@ -109,16 +111,28 @@
                     "status_interval": "Status interval (seconds)",
                     "web_data": "Read the web interface",
                     "firmware_check": "Check for new firmware",
-                    "devices": "Devices"
+                    "devices": "Devices",
+                    "data_source": "Data source",
+                    "all_settings": "Entities for all device settings"
                 },
                 "data_description": {
                     "scan_interval": "How often to read the device list from the gateway. Sensor values arrive by MQTT as soon as they are sent.",
                     "status_interval": "How often to read the gateway's status: links, packets, CPU and memory.",
                     "web_data": "Log in to the gateway's web interface for its serial number, CPU load, memory, storage and uptime. Uses the same account.",
                     "firmware_check": "Look up the newest gateway firmware on milesight.com twice a day.",
-                    "devices": "Only these devices get entities. Leave empty for all devices. Devices you remove from the list are removed from Home Assistant with their entities."
+                    "devices": "Only these devices get entities. Leave empty for all devices. Devices you remove from the list are removed from Home Assistant with their entities.",
+                    "data_source": "Where sensor values come from. LoRaWAN reads the gateway's packet log and decodes with Milesight's own codecs; no MQTT broker needed. MQTT takes what the gateway publishes, decoded by the codecs set up on the gateway.",
+                    "all_settings": "LoRaWAN source only. Off: report interval, target temperature, reboot and status report. On: about 25 more per device, disabled until you enable them."
                 },
                 "title": "Milesight Gateway options"
+            }
+        }
+    },
+    "selector": {
+        "data_source": {
+            "options": {
+                "lorawan": "LoRaWAN (packet log)",
+                "mqtt": "MQTT"
             }
         }
     }

@@ -18,9 +18,11 @@
         "title": "Geräte auswählen",
         "description": "Das Gateway kennt {count} Geräte mit bekanntem Modell. Wählen Sie die aus, die in Home Assistant Entities bekommen sollen, oder lassen Sie die Liste leer für alle.",
         "data": {
+          "data_source": "Datenquelle",
           "devices": "Geräte"
         },
         "data_description": {
+          "data_source": "Woher die Sensorwerte kommen. LoRaWAN liest das Paketlog des Gateways und dekodiert mit Milesights eigenen Codecs, ohne MQTT-Broker. MQTT übernimmt, was das Gateway veröffentlicht, dekodiert mit den Codecs auf dem Gateway.",
           "devices": "Durchsuchbar nach Name, Modell und devEUI. Die Auswahl lässt sich später in den Optionen ändern."
         }
       },
@@ -95,14 +97,18 @@
           "status_interval": "Statusintervall (Sekunden)",
           "web_data": "Weboberfläche abfragen",
           "firmware_check": "Nach neuer Firmware suchen",
-          "devices": "Geräte"
+          "devices": "Geräte",
+          "data_source": "Datenquelle",
+          "all_settings": "Entitäten für alle Geräteeinstellungen"
         },
         "data_description": {
           "scan_interval": "Wie oft die Geräteliste vom Gateway gelesen wird. Sensorwerte kommen per MQTT, sobald sie gesendet werden.",
           "status_interval": "Wie oft der Status des Gateways gelesen wird: Verbindungen, Pakete, CPU und Speicher.",
           "web_data": "Meldet sich an der Weboberfläche des Gateways an, für Seriennummer, CPU-Last, Arbeitsspeicher, Speicherplatz und Laufzeit. Nutzt dasselbe Konto.",
           "firmware_check": "Sucht zweimal am Tag auf milesight.com nach der neuesten Gateway-Firmware.",
-          "devices": "Nur diese Geräte bekommen Entities. Leer lassen für alle Geräte. Was Sie aus der Liste nehmen, verschwindet mit seinen Entities aus Home Assistant."
+          "devices": "Nur diese Geräte bekommen Entities. Leer lassen für alle Geräte. Was Sie aus der Liste nehmen, verschwindet mit seinen Entities aus Home Assistant.",
+          "data_source": "Woher die Sensorwerte kommen. LoRaWAN liest das Paketlog des Gateways und dekodiert mit Milesights eigenen Codecs, ohne MQTT-Broker. MQTT übernimmt, was das Gateway veröffentlicht, dekodiert mit den Codecs auf dem Gateway.",
+          "all_settings": "Nur bei LoRaWAN. Aus: Berichtsintervall, Solltemperatur, Neustart und Statusbericht. An: rund 25 weitere je Gerät, abgeschaltet, bis Sie sie aktivieren."
         }
       }
     }
@@ -120,6 +126,14 @@
   "exceptions": {
     "downlink_failed": {
       "message": "Das Gateway hat den Befehl für das Gerät nicht angenommen: {error}"
+    }
+  },
+  "selector": {
+    "data_source": {
+      "options": {
+        "lorawan": "LoRaWAN (Paketlog)",
+        "mqtt": "MQTT"
+      }
     }
   }
 }

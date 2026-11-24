@@ -18,7 +18,8 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_GATEWAY_URL, DOMAIN
+from . import lorawan_platforms
+from .const import CONF_GATEWAY_URL, DOMAIN, SOURCE_LORAWAN, data_source
 from .coordinator import MilesightDiagnosticsCoordinator
 from .entity import MilesightDeviceEntity, fleet_device_info
 
@@ -62,9 +63,11 @@ async def async_setup_entry(
     # Keyed on the entry id, not the address, so the device survives an IP change.
     gateway_id = config_entry.runtime_data.gateway_device_id
 
+    lorawan = data_source(config_entry.options) == SOURCE_LORAWAN
+    # The LoRaWAN source adds its device binary sensors below, as devices report.
     entities: list[BinarySensorEntity] = [
         MilesightBinarySensor(coordinator, device, entity_def, gateway_url, gateway_id)
-        for device in coordinator.data.devices
+        for device in (() if lorawan else coordinator.data.devices)
         for entity_def in device.entities
         if entity_def.platform == "binary_sensor"
     ]
@@ -91,6 +94,10 @@ async def async_setup_entry(
         )
 
     async_add_entities(entities)
+    if lorawan:
+        await lorawan_platforms.async_setup_binary_sensors(
+            _hass, config_entry, async_add_entities
+        )
 
 
 class _StatusBinarySensor(
