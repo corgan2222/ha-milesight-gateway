@@ -1,501 +1,211 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/corgan2222/ha-milesight-gateway/main/images/header.png" alt="Milesight Gateway — Home Assistant Integration" />
+  <img src="images/header.png" alt="Milesight Gateway, Home Assistant integration" />
 </p>
 
+# Milesight Gateway for Home Assistant
 
-# Milesight Gateway — Home Assistant Integration
+[![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=corgan2222&repository=ha-milesight-gateway&category=integration)
+[![Add the integration to your Home Assistant instance.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=milesight_gateway)
 
-[![GitHub Repository](https://img.shields.io/badge/GitHub-corgan2222%2Fha--milesight--gateway-blue?logo=github)](https://github.com/corgan2222/ha-milesight-gateway)
+Brings Milesight LoRaWAN gateways (UG65, UG67 and their relatives) and the
+sensors behind them into Home Assistant: sensor values, device settings, the
+gateway's own status and a map of the radio network.
 
+![The LoRaWAN network panel](docs/images/network-map.png)
 
-A custom Home Assistant integration that bridges **Milesight LoRaWAN gateways** with Home Assistant, providing real-time sensor data from 130+ Milesight LoRaWAN devices.
+## Features
 
----
-
-## How It Works
-
-The integration talks to the gateway's local HTTP API: it logs in (JWT), reads
-the device list and the gateway's status, and queues downlinks that change
-device settings. Sensor values come from one of two data sources, chosen per
-gateway:
-
-| Data source | How values arrive | Decoded by |
-| ----------- | ----------------- | ---------- |
-| **LoRaWAN** (default for new entries) | The integration reads the network server's packet log every 10 seconds. No MQTT broker needed. | Milesight's own codecs for every model they publish, bundled in [Milesight-Gateway-API](https://github.com/corgan2222/Milesight-Gateway-API) |
-| **MQTT** | The gateway publishes each uplink to your broker; the integration subscribes. | The payload codecs set up on the gateway |
-
-With MQTT, device entities are matched from a built-in database of 130+
-Milesight device models (`devices_ha.json`). With LoRaWAN, entities follow
-Milesight's codec catalog: a reading gets an entity once the device reports
-it, settings and commands get one from the start.
-
-Entries created before the option existed stay on MQTT; switching is an option
-(see [Options](#options)). Fields both sources know keep their entity, entity
-ID and history when you switch; entities only the other source provides are
-removed. On Home Assistant 2026.11 or newer, a LoRaWAN gateway also registers
-with Home Assistant's LoRaWAN integration.
-
----
-
-
+- **Sensors of 145 Milesight models**, decoded with Milesight's own codecs
+- **No MQTT broker needed**: values come from the gateway's packet log. MQTT stays available
+- **Device control**: settings and commands go to the devices as downlinks, a thermostat for the WT101
+- **Network map** as a sidebar panel and a dashboard card, with RSSI and SNR per reception
+- **Gateway status**: packet forwarder, MQTT links, fleet gateways, packet rates, CPU, memory, storage, firmware updates
+- **Device selection**: on a fleet with hundreds of sensors, only the picked ones get entities
+- Set up entirely in the UI; diagnostics download with credentials and identifiers removed
 
 ## Requirements
 
 - Home Assistant 2026.9.0 or newer
-- A Milesight LoRaWAN gateway reachable from your Home Assistant instance
-- Gateway credentials (username & password)
-- Gateway AES encryption settings (Secret Key & IV — found in the gateway's security settings)
-- MQTT data source only: a running [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) and the gateway set up to publish LoRaWAN uplinks to your broker
-
-
----
+- A Milesight LoRaWAN gateway with firmware 60.0.0.42 or newer, reachable from Home Assistant
+- The gateway's login and its AES Secret Key and IV (from the gateway's security settings)
+- For the MQTT data source only: the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) and the gateway publishing uplinks to your broker
 
 ## Installation
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=corgan2222&repository=ha-milesight-gateway&category=integration)
+The integration is in the HACS default list. In HACS, search for **Milesight
+Gateway**, download it and restart Home Assistant. Or use the first button
+above.
 
-then 
+Without HACS, copy `custom_components/milesight_gateway` into your
+`config/custom_components/` folder and restart.
 
-[![Add Integration to your Home Assistant instance.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=milesight_gateway)
+## Setup
 
+**Settings → Devices & services → Add integration → Milesight Gateway**, or the
+second button above.
 
-### HACS (Recommended)
+| Field | Description | Default |
+| ----- | ----------- | ------- |
+| Gateway URL | `http://` or `https://` and the address, without port, for example `https://192.0.2.10` | |
+| Port | Port of the gateway's HTTP API | `8080` |
+| Username, password | The gateway login | |
+| Secret Key, IV | 16 characters each, from the gateway's security settings | `1111111111111111`, `2222222222222222` |
+| MQTT uplink base topic | Only for the MQTT data source | `sensors/lora/uplink` |
 
-1. Open HACS in your Home Assistant sidebar.
-2. Go to **Integrations** → click the three-dot menu → **Custom repositories**.
-3. Add this repository URL https://github.com/corgan2222/ha-milesight-gateway with category **Integration**.
-4. Search for **Milesight Gateway** and install it.
-5. Restart Home Assistant.
+A second step asks for the data source and lists the gateway's devices,
+searchable by name, model and devEUI. Pick the ones that should get entities,
+or leave the list empty for all.
 
-### Manual
+**Reconfigure** changes the address, port, login, key, IV or topic later and
+keeps all devices and entities. An empty password field keeps the stored one.
 
-1. Copy the `custom_components/milesight_gateway` folder into your Home Assistant `config/custom_components/` directory.
-2. Restart Home Assistant.
+## Data sources
 
----
+Each gateway entry uses one of two sources for sensor values:
 
-## Configuration
+| | LoRaWAN | MQTT |
+| --- | --- | --- |
+| How values arrive | The integration reads the network server's packet log every 10 seconds | The gateway publishes each uplink to your broker |
+| Decoded by | Milesight's own codecs, bundled in [Milesight-Gateway-API](https://github.com/corgan2222/Milesight-Gateway-API) | The payload codecs set up on the gateway |
+| Which entities | Milesight's codec catalog: a reading once the device reports it, the essential settings from the start | A built-in list of 130+ models (`devices_ha.json`) |
+| Default | New entries | Entries from before 1.5 |
 
-The integration is configured entirely through the UI — no YAML needed.
+Switch the source under **Configure**. Fields both sources know keep their
+entity, entity ID and history; entities only the other source provides are
+removed. On Home Assistant 2026.11 or newer, a LoRaWAN gateway also registers
+with Home Assistant's own LoRaWAN integration.
 
-### Initial Setup
+With MQTT, the [enriched payload codecs](https://github.com/corgan2222/codec)
+add devEUI, gateway, RSSI, SNR and timestamp to every uplink, which the stock
+Milesight codecs leave out.
 
-Go to **Settings → Devices & Services → Add Integration** and search for **Milesight Gateway**.
+## Options
 
-| Field                      | Description                                                           | Default               |
-| -------------------------- | --------------------------------------------------------------------- | --------------------- |
-| **Gateway URL**            | IP or hostname of the gateway (e.g. `https://192.0.2.10`)         | —                     |
-| **Port**                   | Gateway HTTP API port                                                 | `8080`                |
-| **Username**               | Gateway login username                                                | —                     |
-| **Password**               | Gateway login password                                                | —                     |
-| **Secret Key**             | 16-character AES encryption key (from gateway security settings)      | `1111111111111111`    |
-| **IV**                     | 16-character AES initialization vector (from gateway security settings) | `2222222222222222`  |
-| **MQTT Uplink Base Topic** | Base MQTT topic where the gateway publishes device data               | `sensors/lora/uplink` |
+| Option | Description | Default |
+| ------ | ----------- | ------- |
+| Data source | LoRaWAN or MQTT, see above | LoRaWAN for new entries |
+| Devices | Only these devices get entities. A device taken out is removed with its entities | all |
+| Entities for all device settings | LoRaWAN only. Adds about 25 settings per device, disabled until you enable them | off |
+| Polling interval | How often the device list is read, in seconds (min. 60) | `300` |
+| Status interval | How often the gateway status is read, in seconds (min. 60) | `300` |
+| Read the web interface | Logs in to the gateway's web interface for CPU, memory, storage, uptime and serial number | on |
+| Check for new firmware | Looks up the newest gateway firmware on milesight.com | on |
 
-A second step asks for the [data source](#how-it-works) and lists the gateway's
-devices with a known model. Pick the ones that should get entities, or leave
-the list empty for all of them. On a network with
-hundreds of sensors, this keeps Home Assistant from creating them all first.
-The list is searchable by name, model and devEUI, and the choice can be changed
-later in the options.
+The polling interval only covers the device list. Sensor values arrive as the
+devices send them.
 
-> Use **Reconfigure** to change the gateway URL, port, credentials, Secret Key, IV, or MQTT topic at any time — existing devices and entities are kept. Leave the password field empty to keep the stored password.
+## Network map
 
-### Options
-
-After setup, open **Configure** on the integration entry:
-
-| Option                         | Description                                                                 | Default | Min  |
-| ------------------------------ | --------------------------------------------------------------------------- | ------- | ---- |
-| **Polling interval**           | How often to re-fetch the device list from the gateway (seconds)            | `300`   | `60` |
-| **Status interval**            | How often to read the [gateway status](#gateway-status) (seconds)           | `300`   | `60` |
-| **Read the web interface**     | Log in to the gateway's web interface for CPU, memory, storage, uptime and serial number | on | |
-| **Check for new firmware**     | Look up the newest gateway firmware on milesight.com                         | on      |      |
-| **Devices**                    | Only the picked devices get entities. The list is searchable by name, model and devEUI | all |  |
-| **Data source**                | LoRaWAN (packet log) or MQTT; see [How It Works](#how-it-works)              | MQTT for entries from before the option, LoRaWAN for new ones | |
-| **Entities for all device settings** | LoRaWAN only. Off: report interval, target temperature, reboot and status report. On: about 25 more per device, disabled until you enable them | off | |
-
-> The polling interval only controls the device list. Sensor values arrive as they are sent: by MQTT, or from the packet log within 10 seconds.
-
-Switching a source off removes the entities that only it could fill; switching
-it back on brings them back with the same entity IDs. Entries created before
-the status interval existed keep using the polling interval for it.
-
-A device you take out of the **Devices** list is removed from Home Assistant
-with its entities; a device that is only offline is not affected. The list can
-only be shown while the integration is loaded, since it comes from the gateway.
-
-### LoRaWAN network map
-
-With the LoRaWAN data source, a **LoRaWAN network** panel appears in the
-sidebar. It shows each gateway entry, every gateway of its network server
-(a fleet hub's silent gateways too) and the devices, grouped around the gateway
-that hears them best. Each reception is a line labelled with RSSI and SNR and
-coloured by link quality; the weaker of the two values decides:
+With the LoRaWAN source, a **LoRaWAN network** panel appears in the sidebar
+(picture at the top). It shows every gateway of each entry, a fleet hub's
+silent ones too, and the devices around the gateway that hears them best. Each
+reception is a line with RSSI and SNR, coloured by the weaker of the two:
 
 | Colour | RSSI | SNR |
 | ------ | ---- | --- |
-| green  | ≥ −100 dBm | ≥ 0 dB |
-| yellow | ≥ −110 dBm | ≥ −5 dB |
-| orange | ≥ −120 dBm | ≥ −10 dB |
-| red    | below | below |
+| green | from −100 dBm | from 0 dB |
+| yellow | from −110 dBm | from −5 dB |
+| orange | from −120 dBm | from −10 dB |
+| red | below | below |
 
-![The LoRaWAN network panel with a single gateway and a fleet hub with its gateways](docs/images/network-map.png)
-
-Nodes can be dragged; a double-click lets one go back. Two sliders set the
-length of the stems from an entry to its gateways and from a gateway to its
-devices. The same map is a dashboard card, loaded by the integration itself:
+Nodes can be dragged, a double-click lets one go back. Two sliders set the
+length of the stems to the gateways and to the devices. The same map works as
+a dashboard card, loaded by the integration itself:
 
 ```yaml
 type: custom:milesight-lorawan-map
-gateway: https://192.0.2.10      # entry title or ID; all entries when left out
+gateway: https://192.0.2.10   # entry title or ID; all entries when left out
 height: 500px
-title: Fleet                      # empty hides the title
-labels: true                      # RSSI and SNR on the lines
+title: Fleet                   # empty hides the title
+labels: true                   # RSSI and SNR on the lines
 ```
 
-On Home Assistant 2026.11 or newer, the gateways and devices also show up in
-Home Assistant's own LoRaWAN integration and its network map:
+On Home Assistant 2026.11 or newer, the same gateways and devices also show up
+in Home Assistant's own LoRaWAN integration:
 
 | Overview | Network map | Fleet |
 | -------- | ----------- | ----- |
-| ![Home Assistant's LoRaWAN overview with its connections and devices](docs/images/ha-lorawan-overview.png) | ![Home Assistant's LoRaWAN network map](docs/images/ha-lorawan-map.webp) | ![A fleet hub with its gateways and devices in Home Assistant's LoRaWAN map](docs/images/ha-lorawan-tree.png) |
+| ![Home Assistant's LoRaWAN overview](docs/images/ha-lorawan-overview.png) | ![Home Assistant's LoRaWAN network map](docs/images/ha-lorawan-map.webp) | ![A fleet hub in Home Assistant's LoRaWAN map](docs/images/ha-lorawan-tree.png) |
 
----
+## Devices and entities
 
-## Entities
+Every device gets its readings as sensors and binary sensors, buttons such as
+the WS101 an event entity (`single_press`, `double_press`, `long_press`), and a
+**Last seen** sensor. Spreading factor and frequency of the newest uplink are
+diagnostic entities; RSSI and SNR are too with MQTT and the enriched codecs,
+and with LoRaWAN they are on the network map.
 
-### Gateway Diagnostic Sensors
+### Settings and commands
 
-These entities represent the gateway itself and are always created:
+Settings go to a device as a downlink. A LoRaWAN device only listens right
+after it sends, so a change takes effect after its next uplink. The entity
+shows the new value right away. If the gateway refuses the command, the action
+fails and the entity keeps its old value.
 
-| Entity              | Description                                    | Unit    |
-| ------------------- | ---------------------------------------------- | ------- |
-| **Online Devices**  | Number of devices currently online             | count   |
-| **Offline Devices** | Number of devices currently offline            | count   |
-| **Response Time**   | TCP round-trip time to the gateway API         | ms      |
+Most devices report their settings only when asked, so a setting can show as
+unknown until then; it can be changed anyway. **Request status report** asks
+for one. With LoRaWAN, settings and alarms keep their last value over a
+restart.
 
-### Gateway Status
+### WT101 radiator thermostat
 
-Read with the status interval from the [options](#options). A failing status call
-only makes these entities unavailable, never the device entities.
+| Controls and sensors | Settings and diagnostics |
+| -------------------- | ------------------------ |
+| ![WT101 controls, sensors and settings](docs/images/wt101-controls.png) | ![WT101 settings and diagnostics](docs/images/wt101-settings.png) |
 
-From the network server API:
+- The thermostat sets the target temperature. With LoRaWAN, setting a target
+  also switches the valve from manual mode to regulation, and the heating
+  state comes from the motor position.
+- Child lock, freeze protection, open window detection, outside temperature
+  control, calibration and the target range are switches and numbers.
+- **Manual valve opening** moves the valve directly while temperature control
+  is off. **Outside temperature** feeds a room temperature from another
+  sensor, for example by an automation.
+- The valve position stays unknown until the thermostat is mounted and
+  calibrated.
 
-| Entity                         | Description                                                        |
-| ------------------------------ | ------------------------------------------------------------------ |
-| **Uplinks / Downlinks per minute** | Packets in the gateway's packet log since the last update. Unknown after a restart until the second update |
-| **Packet forwarder**           | Whether the packet forwarder reaches its network server            |
-| **Pending packets**            | Packets waiting in the forwarder's retransmission queue            |
-| **MQTT _application_**         | One per application that has devices: whether its MQTT link reaches the broker (attribute `broker`). Several can be active at once, each forwarding its own devices |
-| **Radio**, **Radio last seen** | Per gateway the network server receives from. The local gateway's go on the gateway device, others get their own device |
-| **Applications**, **Payload codecs**, **Device profiles** | Counts, for diagnosis                           |
-| **Codec library version**      | Version of the gateway's payload codec library                     |
+## Gateway
 
-From the gateway's web interface, which uses its own login with the same account
-as the API. The session is kept and reused; it does not log you out of the web
-interface in your browser. If the web interface refuses the account, the
-integration logs one warning and does not try again until it is reloaded,
-because the gateway locks an account after a few failed logins. Switch off
-**Read the web interface** in the options to skip the login and these entities.
+The gateway device carries:
 
-| Entity                    | Description                                   |
-| ------------------------- | --------------------------------------------- |
-| **CPU load**              | %                                             |
-| **Memory available**      | %                                             |
-| **Storage available**     | eMMC, %                                       |
-| **Last boot**             | From the gateway's uptime, to the minute       |
+- **Online and offline devices**, **response time** of the API
+- **Packet forwarder**, **pending packets**, **uplinks and downlinks per minute**
+- **MQTT link** per application with devices, and one device per fleet gateway with its state and last seen time
+- **CPU load**, **memory** and **storage available**, **last boot**, plus model, serial number and hardware version on the device page. These need **Read the web interface**; after one refused login the integration stops trying until it is reloaded, because the gateway locks an account after a few failed logins.
+- **Firmware**: an update entity that compares the installed firmware with Milesight's download page every 12 hours. Installing stays manual: download the `.bin` and upload it under **Maintenance → Upgrade** on the gateway.
 
-The same login fills the gateway device's model number, serial number and hardware
-version.
-
-The gateway reports times without a zone; they are read in Home Assistant's time
-zone.
-
-### Gateway Firmware
-
-The **Firmware** update entity shows whether Milesight offers newer firmware for the
-gateway. It is checked every 12 hours.
-
-- The installed version comes from the gateway's web interface (`/islogin`), which
-  reports it without a login. The network server API on port 8080 has no call for it.
-  The same call gives the model (for example UG65); both are shown on the gateway
-  device and follow a firmware upgrade at the next check.
-- The newest version comes from Milesight's
-  [firmware download page](https://www.milesight.com/support/resources/firmware). It is
-  matched by the first part of the version (60 for the UG65 and UG67), not by product
-  name. Milesight's upgrade notes, such as a required minimum version, appear as the
-  release summary, and the release notes are linked.
-- Installing stays manual: download the `.bin` file and upload it under
-  **Maintenance → Upgrade** on the gateway. Milesight recommends asking their support
-  before upgrading.
-- Milesight offers no API for this, so the entity reads the download page. If
-  Milesight redesigns that page, the latest version shows as unknown until the
-  integration is updated.
-- Switch off **Check for new firmware** in the options to never contact
-  milesight.com. The entity goes away; model and installed firmware stay on the
-  gateway device.
-
-### Per-Device Sensors
-
-For each discovered LoRaWAN device, entities are created based on the device model's capabilities.
-
-#### Measurement Sensors (`sensor` platform)
-
-| Key                   | Description                | Unit | Device Class           |
-| --------------------- | -------------------------- | ---- | ---------------------- |
-| `battery`             | Battery level              | %    | `battery`              |
-| `temperature`         | Temperature                | °C   | `temperature`          |
-| `humidity`            | Relative humidity          | %    | `humidity`             |
-| `co2`                 | CO₂ concentration          | ppm  | `carbon_dioxide`       |
-| `pressure`            | Atmospheric pressure       | hPa  | `atmospheric_pressure` |
-| `rssi`                | Signal strength            | dBm  | `signal_strength`      |
-| `loRaSNR` / `snr`     | LoRa signal-to-noise ratio | dB   | —                      |
-| `people_total_counts` | People counted in the area | —    | —                      |
-| `valve_opening`       | Valve position of a radiator thermostat | % | —                  |
-
-Every device also gets **Spreading factor** and **Frequency** (disabled by default)
-from its newest uplink in the gateway's packet log.
-
-#### Binary Sensors (`binary_sensor` platform)
-
-| Key                         | Description                         | Device Class |
-| --------------------------- | ----------------------------------- | ------------ |
-| `occupancy`                 | Room occupancy                      | `occupancy`  |
-| `people_total_counts`       | Occupied while the count is above 0 | `occupancy`  |
-| `pir` / `pir_trigger`       | Motion detection                    | `motion`     |
-| `door`                      | Door/window contact                 | `door`       |
-| `liquid` / `leakage_status` | Water/liquid leakage                | `moisture`   |
-| `tamper` / `tamper_status`  | Tamper detection                    | `tamper`     |
-| `window_detection`          | Open window, detected by a thermostat from a temperature drop | `window` |
-
-#### Buttons (`event` platform)
-
-Wireless buttons such as the WS101 get an event entity with the device class
-`button`. Each press fires `single_press`, `long_press` or `double_press`, which
-automations can use as a trigger. A retained MQTT message is an old press and
-does not fire.
-
-#### Special Sensors
-
-| Entity          | Description                                                   |
-| --------------- | ------------------------------------------------------------- |
-| **Last Seen**   | Timestamp of the last MQTT message received from the device   |
-
-> Metadata entities (devEUI, serial number, application name, etc.) are created as diagnostic sensors but disabled by default.
-
----
-
-## Device Control
-
-Settings go to a device as a **downlink**. The integration queues it on the
-gateway, and the gateway encodes it with the payload codec assigned to the
-device. A LoRaWAN device only listens right after it sends, so the change takes
-effect after the device's next uplink. The entity shows the new value as soon
-as the gateway has queued it. If the gateway does not take the command, the
-action fails with an error and the entity keeps its old value.
-
-A device reports its settings only in a status report, not in every uplink.
-Until one arrives, a setting shows as unknown; it can be changed anyway. On
-thermostats, **Request status report** asks for one.
-
-### Radiator thermostats (WT101)
-
-| Entity | Platform | What it does |
-| ------ | -------- | ------------ |
-| Thermostat | `climate` | Current and target temperature. Modes: **Heat** (manual, the target temperature applies), **Auto** (the device's own schedule) and **Off** (temperature control disabled). Shows heating while the valve is open |
-| Request status report, Calibrate valve, Sync time, Reboot | `button` | One-shot commands |
-| Child lock, Open window detection, Freeze protection, Display ambient temperature, Report on change, Outside temperature control, Temperature calibration | `switch` | On/off settings |
-| Valve control algorithm, Offline control mode, Window open valve strategy | `select` | Settings with fixed choices |
-| Reporting interval, Window detection threshold and time, Freeze protection temperature, Outside temperature timeout, Temperature calibration value, Target temperature min/max | `number` | Numeric settings, in the device's units and ranges |
-| Manual valve opening | `number` | Moves the valve directly; the thermostat follows it while its own temperature control is off |
-| Outside temperature | `number` | Feeds a room temperature from another sensor, for example by an automation, while **Outside temperature control** is on. The thermostat falls back to its own sensor when no value arrives within the timeout |
-
-The valve position stays unknown until the thermostat is mounted on a valve and
-calibrated.
-
-### Other models
-
-| Model | Settings |
-| ----- | -------- |
-| AM307, AM307L, AM308, AM308L | Reporting interval (seconds), buzzer, LED indicator |
-| EM300-MLD, EM300-SLD, EM300-TH | Reporting and collection interval |
-| VS321 | Reporting interval, detection mode, collection interval |
-| VS340, VS341 | Reporting interval, vacancy reporting interval, LED indicator |
-| VS350 | Reporting interval |
-| WS203 | Reporting, collection and vacancy reporting interval, LED indicator |
-
-A device can only take settings if the payload codec assigned to it on the
-gateway has an encoder. Some codecs ship without one; those devices get no
-setting entities.
-
----
-
-## Supported Devices
-
-**I could only test a few sensors! Some sensor types may not work, or individual data points may be missing**
-
-The integration includes a built-in database of 130+ Milesight LoRaWAN device models. Device matching is done automatically by devEUI prefix. Supported families include:
-
-- **AM series** — Ambience monitoring (temperature, humidity, CO₂, TVOC, light, pressure)
-- **CT series** — CO₂ sensors
-- **PT series** — Pressure sensors
-- **HR series** — Humidity & temperature sensors
-- **PM / PM25 series** — Particulate matter sensors
-- **AT series** — Ambient temperature sensors
-- Motion, occupancy, door/window, water leakage, and more
-
-If a device's devEUI prefix is not found in the database, it will be skipped (a debug message is logged).
-
----
-
-## Custom Payload Codec Library
-
-The standard Milesight codecs only expose a subset of available sensor datapoints — metadata like device name, devEUI, gateway, RSSI, SNR, and timestamps are missing from the uplink payload.
-
-This integration is designed to work with a custom **[Payload Codec Library](https://github.com/corgan2222/codec)** that enriches every uplink with the full set of available fields.
-
-**Standard Milesight codec output (before):**
-
-```json
-{
-  "battery": 96,
-  "co2": 421,
-  "humidity": 56,
-  "light_level": 4,
-  "pir": 1,
-  "pressure": 1025.4,
-  "temperature": 27.8
-}
-```
-
-**With the custom codec (after):**
-
-```json
-{
-  "devEUI": "24e124707e111005",
-  "deviceName": "Multisensor AM307L",
-  "type": "AM307L",
-  "gw": "Local Gateway",
-  "mac": "24e124fffef8706c",
-  "timestamp": "2024-09-17T18:04:35.151882Z",
-  "applicationID": 5,
-  "applicationName": "cloud",
-  "loRaSNR": 10.5,
-  "rssi": -89,
-
-  "battery": 96,
-  "co2": 421,
-  "humidity": 56,
-  "light_level": 4,
-  "pir": 1,
-  "pressure": 1025.4,
-  "temperature": 27.8,
-  "tvoc": 1
-}
-```
-
-The enriched payload enables all diagnostic entities (RSSI, SNR, Last Seen, device metadata) and additional sensor fields like `tvoc` that the standard codec omits.
-
-**Installation:** Download a release from [github.com/corgan2222/codec](https://github.com/corgan2222/codec) and install it via the **Payload Codec** configuration page on your Milesight gateway.
-
----
+A failing status call makes only these entities unavailable, not the devices.
 
 ## Troubleshooting
 
-When you open an issue, attach the diagnostics: **Settings → Devices & Services
-→ Milesight Gateway → ⋮ → Download diagnostics**. The file shows which device
-models were matched, the options and the gateway status. Passwords, keys,
-addresses, serial numbers, EUIs and names are removed before the download.
+Attach the diagnostics to an issue: **Settings → Devices & services →
+Milesight Gateway → ⋮ → Download diagnostics**. Passwords, keys, addresses,
+serial numbers, EUIs and names are removed.
 
-### Integration fails to set up
-
-- Verify the gateway URL, port, and credentials are correct.
-- Confirm the gateway is reachable from your Home Assistant host.
-- Check that the Secret Key and IV match the gateway's AES settings.
-
-### Entities of a device are unavailable
-
-A device's entities are unavailable while the gateway cannot be reached, or while
-the gateway lists the device as inactive. They come back with the next device
-list refresh (every 5 minutes by default) once both are fine again.
-
-### No sensor data / entities stuck as unknown
-
-- Confirm the MQTT integration is running in Home Assistant.
-- Verify the MQTT broker is receiving uplink messages from the gateway.
-- Check that the **MQTT Uplink Base Topic** matches the topic the gateway publishes to (full topic per device is `{base_topic}/{devEUI}`).
-
-### Devices not appearing
-
-- Only active/online devices are imported. Offline devices are skipped.
-- If a device model is not in the built-in database, it will be silently skipped. Enable debug logging for `custom_components.milesight_gateway` to see which devices were not matched.
-
-### Firmware entity unavailable or unknown
-
-- **Unavailable:** the gateway's web interface or Milesight's download page could not be
-  reached. The gateway URL is used without the API port, so the web interface must be
-  reachable there (port 80 for `http://`, 443 for `https://`). The entity retries every
-  12 hours; the rest of the integration is not affected.
-- **Unknown latest version:** the download page lists no firmware for the gateway's
-  version family, or its layout changed.
-
-### A setting shows unknown or does not change
-
-- Settings appear once the device sends a status report. Press **Request status
-  report** where the device has one, or wait for the device to send one.
-- A change reaches the device after its next uplink. A device that reports every
-  10 minutes takes up to 10 minutes to apply a change.
-- If the device never applies a change, check on the gateway which payload
-  codec is assigned to it. The codec must have an encoder for the setting.
-
-### Updating the connection
-
-- Use **Settings → Devices & Services → Milesight Gateway → Reconfigure** to change the gateway URL, port, username, password, Secret Key, IV, or MQTT topic without removing the integration. Your devices, entities and their history are kept.
-- If the gateway moved to a different IP address, this is the place to correct it — the entry will reconnect after the reload.
-
----
+- **Setup fails:** check address, port, login, Secret Key and IV, and that Home Assistant reaches the gateway.
+- **A device's entities are unavailable:** the gateway is unreachable or lists the device as inactive. They come back with the next device list.
+- **No values with MQTT:** the MQTT integration must run, and the base topic must match what the gateway publishes (`{base_topic}/{devEUI}`).
+- **A device is missing:** offline devices and models without a definition are skipped. Debug logging for `custom_components.milesight_gateway` names them.
+- **A setting does not change:** it reaches the device after its next uplink. With MQTT, the payload codec assigned on the gateway needs an encoder.
+- **Firmware unavailable:** the web interface must be reachable at the gateway URL without the API port (80 or 443).
 
 ## Removal
 
-1. Go to **Settings → Devices & Services → Milesight Gateway**.
-2. Open the **⋮** menu on the integration entry and choose **Delete**.
+**Settings → Devices & services → Milesight Gateway → ⋮ → Delete** removes the
+entry with all its devices and entities. Nothing is left on the gateway; stop
+its MQTT publishing there if you no longer need it. To remove the files, use
+**HACS → Milesight Gateway → ⋮ → Remove** and restart.
 
-This removes the config entry together with every device and entity it created.
-No settings are left behind on the gateway itself, and the gateway keeps
-publishing to MQTT — stop that in the gateway's own configuration if you no
-longer want the uplinks.
+## Contributing and credits
 
-If you installed through HACS and want the files gone as well, open **HACS →
-Milesight Gateway → ⋮ → Remove** afterwards and restart Home Assistant.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The gateway communication lives in
+[Milesight-Gateway-API](https://github.com/corgan2222/Milesight-Gateway-API)
+([PyPI](https://pypi.org/project/Milesight-Gateway-API/)). The device decoders
+are Milesight's own, from [Milesight-IoT/codec](https://github.com/Milesight-IoT/codec) (MIT).
 
----
-
-## Roadmap / ToDo
-
-- **Auto-discover MQTT topic** — read the uplink topic directly from the gateway API instead of requiring manual configuration
-- **Thermostat heating schedules** — the WT101's weekly schedule and heating period are not exposed yet
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.
-
-
-
-## Credits
-
-This integration is built on top of my [Milesight-Gateway-API](https://github.com/corgan2222/Milesight-Gateway-API) Python package, which handles authentication and communication with the Milesight gateway HTTP API.
-
-https://pypi.org/project/Milesight-Gateway-API/
-
-```bash
-pip install Milesight-Gateway-API
-```
-
----
+Only a few of the supported sensor models have been tested on real hardware.
+If a model misses a value, please open an issue with the diagnostics.
 
 ## License
 
-This project is licensed under the terms in [LICENSE](LICENSE).
+See [LICENSE](LICENSE).
