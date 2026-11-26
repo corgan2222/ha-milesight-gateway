@@ -11,12 +11,12 @@ Brings Milesight LoRaWAN gateways (UG65, UG67 and their relatives) and the
 sensors behind them into Home Assistant: sensor values, device settings, the
 gateway's own status and a map of the radio network.
 
-![The LoRaWAN devices page](docs/images/devices-page.png)
+![Network map and device list in Home Assistant](images/pages-showcase.png)
 
 ## Features
 
 - **Sensors of 145 Milesight models**, decoded with Milesight's own codecs
-- **Two modes**: MQTT through your broker, or REST straight from the gateway with no broker at all
+- **Three modes**: REST straight from the gateway with no broker at all, MQTT through your broker, or both
 - **No custom payload codec needed**: the gateway's built-in codecs already deliver RSSI, SNR, data rate and frame counter
 - **Devices page**: set many devices at once, follow each command until the device confirms it, add devices to the gateway
 - **Network page** and dashboard card with RSSI and SNR of every reception
@@ -54,10 +54,16 @@ by name, model and devEUI. Pick the ones that should get entities, or leave
 the list empty for all. **Reconfigure** changes address, login, key or IV
 later and keeps all devices and entities.
 
-## Two modes: MQTT and REST
+## Modes: REST, MQTT and hybrid
+
+| LoRaWAN REST | MQTT standalone | Hybrid |
+| :---: | :---: | :---: |
+| <img src="images/mode-lorawan-rest.png" width="270" alt="LoRaWAN REST mode"> | <img src="images/mode-mqtt.png" width="270" alt="MQTT standalone mode"> | <img src="images/mode-hybrid.png" width="270" alt="Hybrid mode, REST and MQTT"> |
 
 Each gateway entry runs in one mode. The options call it the data source;
-REST is listed there as **LoRaWAN**.
+REST is listed there as **LoRaWAN**, hybrid as **MQTT**. MQTT standalone is
+an entry with the web login only, such as a UG63; its devices come in over
+MQTT alone.
 
 | | MQTT | REST |
 | --- | --- | --- |
@@ -136,16 +142,14 @@ as a water, gas or energy meter. A people counter also tells occupancy: on
 from one person. The regions and line crossings of a workplace sensor such as
 the VS121 start disabled; enable the ones you drew in its image.
 
+![Device pages of a sensor, a gateway and a WT101 thermostat, and the options dialog](images/devices-showcase.png)
+
 The essential settings are entities from the start: report interval, reboot,
 status request, and the target temperature of a thermostat. Most devices
 report their settings only when asked, so one can show as unknown until then;
 it can be changed anyway.
 
 ### WT101 radiator thermostat
-
-| Controls and sensors | Settings and diagnostics |
-| -------------------- | ------------------------ |
-| ![WT101 controls, sensors and settings](docs/images/wt101-controls.png) | ![WT101 settings and diagnostics](docs/images/wt101-settings.png) |
 
 - The thermostat entity sets the target temperature; setting one switches the
   valve from manual mode to regulation.
