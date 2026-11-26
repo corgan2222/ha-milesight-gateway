@@ -14,6 +14,7 @@ source keeps entity IDs, history and automations of every shared field.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
@@ -130,6 +131,51 @@ ESSENTIAL_CONTROLS = frozenset(
 )
 
 
+# A people count also gets an occupancy binary sensor under the same key.
+PEOPLE_COUNTS = frozenset({"people_total_counts", "people_count_all"})
+# Readings a counter only has for what was drawn in its image: up to sixteen
+# regions and the crossings between four lines. Their entities start disabled,
+# or a counter without regions shows forty rows that never get a value.
+# hass.data key: the entries whose optional readings without a value are
+# disabled as they load, once, after the update that made them start disabled.
+RETIRE_EMPTY_OPTIONAL = f"{DOMAIN}_retire_empty_optional"
+OPTIONAL = re.compile(r"region_(\d+(_count)?|count)|[a-d]_to_[a-d]")
+# Words a gateway codec writes for an active two-state value.
+_ACTIVE_WORDS = frozenset({"true", "on", "open", "motion", "occupied", "trigger"})
+
+
+def value_name(field: dict[str, Any], raw: Any) -> str | None:
+    """
+    Name an enumerated raw value.
+
+    The decoders here report the number; a payload codec on the gateway may
+    already have put the name in its place.
+    """
+    if raw is None:
+        return None
+    names = field.get("values") or {}
+    if (name := names.get(str(raw))) is not None:
+        return name
+    return raw if isinstance(raw, str) and raw in names.values() else None
+
+
+def is_set(field: dict[str, Any], raw: Any) -> bool | None:
+    """Tell whether a two-state value is on: not 0, by number or by name."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    for value, name in (field.get("values") or {}).items():
+        if str(name).lower() == text:
+            text = value
+            break
+    try:
+        return float(text) != 0
+    except ValueError:
+        return text in _ACTIVE_WORDS
+
+
 def is_binary(_key: str, field: dict[str, Any]) -> bool:
     """Tell whether a field has two states, for a binary sensor."""
     return field.get("type") == "BOOL"
@@ -179,6 +225,8 @@ def setting_kind(key: str, field: dict[str, Any]) -> dict[str, Any]:
 def sensor_kind(key: str, field: dict[str, Any]) -> dict[str, Any]:
     """Entity description arguments for a non-binary field."""
     kind: dict[str, Any] = {"name": field.get("name") or key}
+    if OPTIONAL.fullmatch(key):
+        kind["entity_registry_enabled_default"] = False
     # "diagnostic" marks fields outside the catalog, such as the radio values
     # a payload codec adds on MQTT.
     if key in INFO_FIELDS or field.get("diagnostic"):
@@ -229,7 +277,11 @@ def registered_keys(coordinator: MilesightLoRaWANCoordinator) -> set[str]:
 
     Alarms like tamper or an open window arrive only on change, settings only
     on request; without this their entities would stay unavailable until then.
+    Read once per device: every platform asks, and a fleet has thousands of
+    entities to look through.
     """
+    if (cached := getattr(coordinator, "registered", None)) is not None:
+        return cached
     prefix = f"{device_eui(coordinator.data)}_"
     original = {legacy: key for key, legacy in LEGACY_KEYS.items()}
     registry = er.async_get(coordinator.hass)
@@ -240,6 +292,7 @@ def registered_keys(coordinator: MilesightLoRaWANCoordinator) -> set[str]:
         if item.unique_id.startswith(prefix):
             key = item.unique_id.removeprefix(prefix)
             keys.add(original.get(key, key))
+    coordinator.registered = keys
     return keys
 
 
@@ -301,8 +354,14 @@ class MilesightLoRaWANEntity(CoordinatorEntity[MilesightLoRaWANCoordinator]):
 
     @property
     def available(self) -> bool:
-        """Unavailable once the gateway drops the device."""
-        return super().available and not self.device.closed
+        """Unavailable once the gateway drops the device or lists it inactive."""
+        device = self.device
+        return (
+            super().available
+            and not device.closed
+            # Only MQTT devices know it; the LoRaWAN source closes them instead.
+            and getattr(device, "active", True)
+        )
 
     @property
     def field(self) -> dict[str, Any]:
@@ -317,7 +376,7 @@ class MilesightLoRaWANEntity(CoordinatorEntity[MilesightLoRaWANCoordinator]):
     async def async_send(self, changes: dict[str, Any]) -> None:
         """Send settings or commands; the device applies them after its next uplink."""
         try:
-            await self.device.async_set(changes)
+            await self.coordinator.commands.async_send(changes)
         except (decoder.EncodeError, DownlinkError) as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,

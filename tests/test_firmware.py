@@ -33,7 +33,6 @@ def _api() -> MilesightGatewayAPI:
         password="secret",  # noqa: S106
         secret_key="1111111111111111",  # noqa: S106
         iv="2222222222222222",
-        mqtt_base_topic="sensors/lora/uplink",
     )
 
 

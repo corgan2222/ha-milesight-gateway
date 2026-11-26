@@ -1,16 +1,19 @@
 """
-Entities of the LoRaWAN data source, one setup function per platform.
+Device entities, one setup function per platform.
 
-The platform modules of the integration call these for entries whose data
-source is LoRaWAN, in place of their MQTT device entities.
+The platform modules of the integration call these for every entry that has
+devices, whichever data source feeds them: both build the same device models.
 """
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Iterable
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
@@ -45,11 +48,17 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
 from milesight_gateway_api import decoder
 
-from .lorawan_coordinator import MilesightLoRaWANCoordinator
+from . import commands, link
+from .lorawan_coordinator import MilesightLoRaWANCoordinator, device_eui
 from .lorawan_entity import (
+    OPTIONAL,
+    PEOPLE_COUNTS,
+    RETIRE_EMPTY_OPTIONAL,
     MilesightLoRaWANEntity,
     binary_kind,
     event_type,
@@ -57,10 +66,12 @@ from .lorawan_entity import (
     is_binary,
     is_event,
     is_sensor,
+    is_set,
     registered_keys,
     sensor_kind,
     setting_kind,
     track_fields,
+    value_name,
     wanted_control,
 )
 
@@ -72,10 +83,54 @@ if TYPE_CHECKING:
 Make = Callable[[MilesightLoRaWANCoordinator, str, dict[str, Any]], Any]
 
 
+class _Batch:
+    """
+    Collect the entities a platform setup adds, and add them in one call.
+
+    Each add_entities call is a task of its own; a fleet of 100 devices made
+    880 of them at setup. Entities of devices added later go straight on.
+    """
+
+    def __init__(self, add_entities: AddEntitiesCallback) -> None:
+        self._add = add_entities
+        self._held: list[Any] | None = []
+
+    def __call__(self, entities: Iterable[Any]) -> None:
+        if self._held is None:
+            self._add(entities)
+        else:
+            self._held.extend(entities)
+
+    def flush(self) -> None:
+        held, self._held = self._held, None
+        if held:
+            self._add(held)
+
+
+def _batched(setup: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a platform setup with its entities added in one call."""
+
+    @functools.wraps(setup)
+    async def run(
+        hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
+    ) -> None:
+        batch = _Batch(add_entities)
+        await setup(hass, entry, batch)
+        batch.flush()
+
+    return run
+
+
 def _for_each_device(
     entry: ConfigEntry, setup: Callable[[MilesightLoRaWANCoordinator], None]
 ) -> None:
     entry.async_on_unload(entry.runtime_data.devices.subscribe_coordinator_added(setup))
+
+
+def _sends_downlinks(entry: ConfigEntry) -> bool:
+    """Whether the entry has devices that take settings: it needs a way to send."""
+    devices = entry.runtime_data.devices
+    return devices is not None and devices.sends_downlinks
 
 
 def _readings(
@@ -110,6 +165,8 @@ def _controls(
     uplinks (a WT101 sends its valve opening every minute) gets its entity
     when it first does, enabled, whatever the "all settings" option says.
     """
+    if not _sends_downlinks(entry):
+        return
 
     @callback
     def added(coordinator: MilesightLoRaWANCoordinator) -> None:
@@ -160,14 +217,35 @@ class _Remembered(MilesightLoRaWANEntity, RestoreEntity):
             return
         last = await self.async_get_last_state()
         if last is None or last.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            self._retire_if_never_used(key)
             return
         try:
             raw = self._raw_from(last.state)
         except StopIteration, ValueError:
             return
         self.device.values.setdefault(key, raw)
-        # The thermostat reads the same value.
-        self.coordinator.async_update_listeners()
+        # The thermostat reads the same value. Only then: every entity of the
+        # device would write its state again, for each one restored.
+        if TARGET in self.device.settings:
+            self.coordinator.async_update_listeners()
+
+    def _retire_if_never_used(self, key: str) -> None:
+        """
+        Disable a region or line reading an older version made enabled.
+
+        Only in the run that follows the update, and only without a value: one
+        that carries a value is in use, and what is enabled later stays.
+        """
+        entry = self.coordinator.config_entry
+        if (
+            OPTIONAL.fullmatch(key)
+            and entry.entry_id in self.hass.data.get(RETIRE_EMPTY_OPTIONAL, ())
+            and self.registry_entry is not None
+            and not self.registry_entry.disabled
+        ):
+            er.async_get(self.hass).async_update_entity(
+                self.entity_id, disabled_by=er.RegistryEntryDisabler.INTEGRATION
+            )
 
 
 # --- readings ----------------------------------------------------------------
@@ -193,7 +271,7 @@ class MilesightLoRaWANSensor(_Remembered, SensorEntity):
         if raw is None:
             return None
         if self.entity_description.device_class == SensorDeviceClass.ENUM:
-            return self.field["values"].get(str(raw))
+            return value_name(self.field, raw)
         if self.entity_description.state_class is not None:
             number = isinstance(raw, (int, float)) and not isinstance(raw, bool)
             return raw if number else None
@@ -222,6 +300,179 @@ class MilesightLoRaWANLastSeen(MilesightLoRaWANEntity, SensorEntity):
             self.device.descriptor.dev_eui
         )
         return uplink.received_at if uplink else None
+
+
+class MilesightCommandStatus(MilesightLoRaWANEntity, SensorEntity):
+    """What became of the last settings or command sent to the device."""
+
+    _unrecorded_attributes = frozenset({"command", "reported", "attempts"})
+
+    def __init__(self, coordinator: MilesightLoRaWANCoordinator) -> None:
+        """One per device that takes downlinks."""
+        super().__init__(
+            coordinator,
+            SensorEntityDescription(
+                key="command_status",
+                translation_key="command_status",
+                device_class=SensorDeviceClass.ENUM,
+                options=commands.STATES,
+                entity_category=EntityCategory.DIAGNOSTIC,
+            ),
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        """The state of the newest command, or None before the first."""
+        return self.coordinator.commands.state
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """What was sent, how often, and what the device reported back."""
+        tracker = self.coordinator.commands
+        if tracker.state is None:
+            return None
+        return {
+            "command": tracker.changes,
+            "attempts": tracker.attempts,
+            "reported": tracker.reported,
+            "changed_at": tracker.changed_at,
+        }
+
+
+class _LinkSensor(MilesightLoRaWANEntity, SensorEntity):
+    """A value derived from the device's uplinks since Home Assistant started."""
+
+    def __init__(
+        self, coordinator: MilesightLoRaWANCoordinator, key: str, **kwargs: Any
+    ) -> None:
+        """Diagnostic, named by translation."""
+        super().__init__(
+            coordinator,
+            SensorEntityDescription(
+                key=key,
+                translation_key=key,
+                entity_category=EntityCategory.DIAGNOSTIC,
+                **kwargs,
+            ),
+        )
+
+
+class MilesightSignalQuality(_LinkSensor):
+    """Excellent to poor, by how far the SNR clears the spreading factor's floor."""
+
+    def __init__(self, coordinator: MilesightLoRaWANCoordinator) -> None:
+        """Offer the link qualities as an enumeration."""
+        super().__init__(
+            coordinator,
+            "signal_quality",
+            device_class=SensorDeviceClass.ENUM,
+            options=link.QUALITIES,
+        )
+
+    def _spreading_factor(self) -> int | None:
+        if (sf := self.coordinator.link.spreading_factor) is not None:
+            return sf
+        # The LoRaWAN source reads it from the packet log instead.
+        status = self.coordinator.entry.runtime_data.diagnostics.data
+        packet = (
+            status.last_uplinks.get(self.device.descriptor.dev_eui.lower())
+            if status
+            else None
+        )
+        return packet.spread_factor if packet else None
+
+    @property
+    def native_value(self) -> str | None:
+        """The quality of the newest uplink."""
+        margin = link.link_margin(self.coordinator.link.snr, self._spreading_factor())
+        return link.quality(margin)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The margin and what it was computed from."""
+        sf = self._spreading_factor()
+        return {
+            "link_margin": link.link_margin(self.coordinator.link.snr, sf),
+            "snr": self.coordinator.link.snr,
+            "spreading_factor": sf,
+        }
+
+
+class MilesightPacketLoss(_LinkSensor):
+    """Uplinks lost today, from the gaps in the frame counter."""
+
+    def __init__(self, coordinator: MilesightLoRaWANCoordinator) -> None:
+        """Report a percentage."""
+        super().__init__(
+            coordinator,
+            "packet_loss",
+            native_unit_of_measurement="%",
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Lost of all uplinks since local midnight, in percent."""
+        return self.coordinator.link.packet_loss
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The counts behind the percentage."""
+        stats = self.coordinator.link
+        return {"received": stats.received_today, "lost": stats.lost_today}
+
+
+class MilesightGatewaysInRange(_LinkSensor):
+    """How many gateways heard the device within the last 24 hours."""
+
+    def __init__(self, coordinator: MilesightLoRaWANCoordinator) -> None:
+        """Count them; the gateways go in an attribute."""
+        super().__init__(
+            coordinator, "gateways_in_range", state_class=SensorStateClass.MEASUREMENT
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        """The count, or None before an uplink names a gateway."""
+        heard = self.coordinator.link.in_range()
+        return len(heard) if self.coordinator.link.gateways else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Each gateway with its newest RSSI and SNR."""
+        return {
+            "gateways": {
+                gateway: {"rssi": h.rssi, "snr": h.snr, "last_heard": h.at.isoformat()}
+                for gateway, h in self.coordinator.link.in_range().items()
+            }
+        }
+
+
+class MilesightBatteryDaysLeft(_LinkSensor):
+    """Days until the battery is empty, from the trend of its level."""
+
+    def __init__(self, coordinator: MilesightLoRaWANCoordinator) -> None:
+        """Report a duration in days."""
+        super().__init__(
+            coordinator,
+            "battery_days_left",
+            device_class=SensorDeviceClass.DURATION,
+            native_unit_of_measurement="d",
+            suggested_display_precision=0,
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """None until the level has fallen over a few days."""
+        log = self.coordinator.entry.runtime_data.battery
+        return log.days_left(device_eui(self.device)) if log else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """When the battery is due, as a date."""
+        if (days := self.native_value) is None:
+            return None
+        return {"replacement_due": (dt_util.now() + timedelta(days=days)).date()}
 
 
 # Keys as the MQTT source names them, so switching keeps the history.
@@ -262,6 +513,7 @@ class MilesightLoRaWANSignal(MilesightLoRaWANEntity, SensorEntity):
         return best.rssi if self.entity_description.key == "rssi" else best.snr
 
 
+@_batched
 async def async_setup_sensors(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -275,6 +527,23 @@ async def async_setup_sensors(
         ),
     )
     _for_each_device(entry, lambda c: add_entities([MilesightLoRaWANLastSeen(c)]))
+    if _sends_downlinks(entry):
+        _for_each_device(entry, lambda c: add_entities([MilesightCommandStatus(c)]))
+    mqtt = entry.runtime_data.mqtt is not None
+    _for_each_device(
+        entry,
+        lambda c: add_entities(
+            [MilesightBatteryDaysLeft(c)] if "battery" in c.data.fields else []
+        ),
+    )
+    _for_each_device(
+        entry,
+        lambda c: add_entities(
+            [MilesightSignalQuality(c), MilesightGatewaysInRange(c)]
+            # The packet log has no frame counter for the LoRaWAN source.
+            + ([MilesightPacketLoss(c)] if mqtt else [])
+        ),
+    )
     # Only the packet log knows the receptions; on MQTT a payload codec may
     # add the same values as fields, which the readings above cover.
     if entry.runtime_data.lorawan is not None:
@@ -294,13 +563,33 @@ class MilesightLoRaWANBinarySensor(_Remembered, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool | None:
-        """On for any value but 0."""
-        try:
-            return None if self.raw is None else int(self.raw) != 0
-        except TypeError, ValueError:
-            return None
+        """On for any value but 0, or for a word that means so."""
+        return is_set(self.field, self.raw)
 
 
+class MilesightLoRaWANOccupancy(MilesightLoRaWANEntity, BinarySensorEntity):
+    """Occupied while a people counter counts anyone."""
+
+    def __init__(self, coordinator: MilesightLoRaWANCoordinator, key: str) -> None:
+        """Share the count's key; the platform tells the two apart."""
+        super().__init__(
+            coordinator,
+            BinarySensorEntityDescription(
+                key=key,
+                name="Occupancy",
+                device_class=BinarySensorDeviceClass.OCCUPANCY,
+            ),
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """On from one person."""
+        raw = self.raw
+        number = isinstance(raw, (int, float)) and not isinstance(raw, bool)
+        return raw > 0 if number else None
+
+
+@_batched
 async def async_setup_binary_sensors(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -312,6 +601,12 @@ async def async_setup_binary_sensors(
         lambda c, key, field: MilesightLoRaWANBinarySensor(
             c, BinarySensorEntityDescription(key=key, **binary_kind(key, field))
         ),
+    )
+    _readings(
+        entry,
+        add_entities,
+        lambda key, _field: key in PEOPLE_COUNTS,
+        lambda c, key, _field: MilesightLoRaWANOccupancy(c, key),
     )
 
 
@@ -331,12 +626,13 @@ class MilesightLoRaWANEvent(MilesightLoRaWANEntity, EventEntity):
         if device.uplinks != self._seen:
             self._seen = device.uplinks
             raw = decoder.flatten(device.last_decoded).get(self.entity_description.key)
-            name = None if raw is None else self.field["values"].get(str(raw))
+            name = value_name(self.field, raw)
             if name is not None:
                 self._trigger_event(event_type(name))
         super()._handle_coordinator_update()
 
 
+@_batched
 async def async_setup_events(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -418,6 +714,7 @@ def _number(
     )
 
 
+@_batched
 async def async_setup_numbers(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -439,7 +736,7 @@ class MilesightLoRaWANSelect(_Remembered, SelectEntity):
     @property
     def current_option(self) -> str | None:
         """The name of the reported or last set value."""
-        return None if self.raw is None else self.field["values"].get(str(self.raw))
+        return value_name(self.field, self.raw)
 
     async def async_select_option(self, option: str) -> None:
         """Send the raw value behind the chosen name."""
@@ -447,6 +744,7 @@ class MilesightLoRaWANSelect(_Remembered, SelectEntity):
         await self.async_send({self.entity_description.key: int(raw)})
 
 
+@_batched
 async def async_setup_selects(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -479,10 +777,7 @@ class MilesightLoRaWANSwitch(_Remembered, SwitchEntity):
     @property
     def is_on(self) -> bool | None:
         """On for any value but 0."""
-        try:
-            return None if self.raw is None else int(self.raw) != 0
-        except TypeError, ValueError:
-            return None
+        return is_set(self.field, self.raw)
 
     async def async_turn_on(self, **_kwargs: Any) -> None:
         """Send 1."""
@@ -493,6 +788,7 @@ class MilesightLoRaWANSwitch(_Remembered, SwitchEntity):
         await self.async_send({self.entity_description.key: 0})
 
 
+@_batched
 async def async_setup_switches(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -515,6 +811,7 @@ class MilesightLoRaWANButton(MilesightLoRaWANEntity, ButtonEntity):
         await self.async_send({self.entity_description.key: 1})
 
 
+@_batched
 async def async_setup_buttons(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
@@ -682,10 +979,13 @@ class MilesightLoRaWANClimate(MilesightLoRaWANEntity, ClimateEntity):
         await self.async_set_hvac_mode(HVACMode.OFF)
 
 
+@_batched
 async def async_setup_climates(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
     """Add a thermostat for every model with a settable target temperature."""
+    if not _sends_downlinks(entry):
+        return
 
     @callback
     def added(coordinator: MilesightLoRaWANCoordinator) -> None:

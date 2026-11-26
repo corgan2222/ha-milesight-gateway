@@ -43,6 +43,7 @@ from .const import (
     CONF_ALL_SETTINGS,
     CONF_DATA_SOURCE,
     CONF_DEVICES,
+    CONF_DEVICES_PANEL,
     CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
     CONF_GATEWAY_ONLY,
@@ -51,6 +52,12 @@ from .const import (
     CONF_IV,
     CONF_MAC,
     CONF_MODEL,
+    CONF_MQTT_ACK_TOPIC,
+    CONF_MQTT_DOWNLINK_TOPIC,
+    CONF_MQTT_ERROR_TOPIC,
+    CONF_MQTT_JOIN_TOPIC,
+    CONF_MQTT_REQUEST_TOPIC,
+    CONF_MQTT_RESPONSE_TOPIC,
     CONF_MQTT_TOPIC,
     CONF_NETWORK_PANEL,
     CONF_SECRET_KEY,
@@ -72,7 +79,12 @@ from .const import (
 )
 from .coordinator import status_interval
 from .hostname import short_hostname, tracker_hostname
-from .mqtt_discovery import topic_error
+from .mqtt_discovery import (
+    downlink_error,
+    request_error,
+    sibling_topic,
+    topic_error,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -218,7 +230,6 @@ def _api(data: Mapping[str, Any]) -> MilesightGatewayAPI:
         password=data[CONF_PASSWORD],
         secret_key=data[CONF_SECRET_KEY],
         iv=data[CONF_IV],
-        mqtt_base_topic=data[CONF_GATEWAY_MQTT_BASE_TOPIC],
     )
 
 
@@ -306,7 +317,7 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Milesight Gateway."""
 
     VERSION = 1
-    MINOR_VERSION = 2
+    MINOR_VERSION = 3
 
     def __init__(self) -> None:
         """Hold the first step's input until the devices are chosen."""
@@ -679,6 +690,40 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
+# A gateway-only entry's topics: the check, and the level a Milesight topic
+# has in place of "uplink" (the request topic keeps the gateway's spelling).
+_TOPICS = {
+    CONF_MQTT_TOPIC: (topic_error, None),
+    CONF_MQTT_DOWNLINK_TOPIC: (downlink_error, "downlink"),
+    CONF_MQTT_ACK_TOPIC: (downlink_error, "ack"),
+    CONF_MQTT_ERROR_TOPIC: (downlink_error, "error"),
+    CONF_MQTT_JOIN_TOPIC: (downlink_error, "join"),
+    CONF_MQTT_REQUEST_TOPIC: (request_error, "reqeust"),
+    CONF_MQTT_RESPONSE_TOPIC: (request_error, "response"),
+}
+
+
+def _suggested_topic(uplink: str, kind: str | None) -> str | None:
+    """Suggest a topic next to the uplink topic; requests name no device."""
+    if kind is None:
+        return uplink
+    suggested = sibling_topic(uplink, kind)
+    if suggested and kind in ("reqeust", "response"):
+        return suggested.replace("{dev_eui}", "$deveui")
+    return suggested
+
+
+def _topic_errors(user_input: dict[str, Any]) -> dict[str, str]:
+    """Trim the MQTT topics in place and say which ones are unusable."""
+    errors: dict[str, str] = {}
+    # Emptied, a field is missing: no devices, or no downlinks, any more.
+    for key, (check, _kind) in _TOPICS.items():
+        topic = user_input[key] = (user_input.get(key) or "").strip()
+        if topic and (error := check(topic)):
+            errors[key] = error
+    return errors
+
+
 class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
     """Handle options for the Milesight Gateway integration."""
 
@@ -701,11 +746,7 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
                 # this the merge below would keep the old selection.
                 user_input.setdefault(CONF_DEVICES, [])
             if only_gateway:
-                # Emptied, the field is missing: no devices on MQTT any more.
-                topic = (user_input.get(CONF_MQTT_TOPIC) or "").strip()
-                user_input[CONF_MQTT_TOPIC] = topic
-                if topic and (error := topic_error(topic)):
-                    errors[CONF_MQTT_TOPIC] = error
+                errors = _topic_errors(user_input)
             if not errors:
                 self._pending = self.config_entry.options | user_input
                 if data_source(self._pending) != data_source(self.config_entry.options):
@@ -727,6 +768,11 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
                 default=options.get(CONF_FIRMWARE_CHECK, True),
             ): bool,
         }
+        schema[
+            vol.Required(
+                CONF_DEVICES_PANEL, default=options.get(CONF_DEVICES_PANEL, True)
+            )
+        ] = bool
         if not only_gateway:
             schema[vol.Required(CONF_DATA_SOURCE, default=data_source(options))] = (
                 source_selector()
@@ -755,12 +801,12 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
                 )
             ] = device_selector(choices)
         if only_gateway:
-            schema[
-                vol.Optional(
-                    CONF_MQTT_TOPIC,
-                    description={"suggested_value": options.get(CONF_MQTT_TOPIC)},
-                )
-            ] = str
+            uplink = options.get(CONF_MQTT_TOPIC) or ""
+            for key, (_check, kind) in _TOPICS.items():
+                suggested = options.get(key, _suggested_topic(uplink, kind))
+                schema[
+                    vol.Optional(key, description={"suggested_value": suggested})
+                ] = str
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(schema),

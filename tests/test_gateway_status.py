@@ -52,7 +52,6 @@ def _api() -> MilesightGatewayAPI:
         password="secret",  # noqa: S106
         secret_key="1111111111111111",  # noqa: S106
         iv="2222222222222222",
-        mqtt_base_topic="sensors/lora/uplink",
     )
 
 
@@ -347,6 +346,17 @@ NS = {
             "junk",
         ],
     },
+    # About the gateway it runs on, the network server answers with empty fields.
+    "/api/gateways/24E124FFFEF8706C": {"mac": "24E124FFFEF8706C", "networkIP": ""},
+    "/api/gateways/24E124FFFE000001": {
+        "mac": "24E124FFFE000001",
+        "wanStatus": "Connected",
+        "networkIP": "192.0.2.20",
+        "systemRuntime": "3600",
+        "systemRunningStatus": [0],
+        "cellularNetworkStatus": "Disconnected",
+        "cellularSignal": "0asu (-113dBm)",
+    },
     "/api/urapplications": {
         "totalCount": "3",
         "result": [
@@ -400,6 +410,13 @@ async def test_network_status_is_read(hass, aioclient_mock):
             name="24E124FFFE000001",
             connected=None,
             last_seen=None,
+            # What the hub knows of a member besides its radio.
+            wan_connected=True,
+            ip="192.0.2.20",
+            uptime=3600,
+            system_ok=True,
+            cellular_connected=False,
+            cellular_signal=-113,
         ),
     ]
     # Only applications with devices and an MQTT link; 3 means connected.
@@ -479,3 +496,30 @@ async def test_a_non_object_status_answer_is_a_connection_error(
 
     with pytest.raises(APIConnectionError):
         await _api().async_get_network_status(async_get_clientsession(hass))
+
+
+async def test_a_fleet_member_without_detail_keeps_the_status(hass, aioclient_mock):
+    """Older firmware has no detail call; the rest of the status still comes."""
+    _mock_ns(aioclient_mock, {"/api/gateways/24E124FFFE000001": {"status_code": 404}})
+
+    status = await _api().async_get_network_status(async_get_clientsession(hass))
+
+    member = status.gateways[1]
+    assert (member.eui, member.ip, member.wan_connected) == (
+        "24E124FFFE000001",
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, "junk", {}, {"networkIP": "0.0.0.0", "systemRuntime": "soon"}],  # noqa: S104
+)
+def test_a_fleet_detail_is_foreign_json(raw):
+    """The hub's own entry comes with empty fields; nothing of it is a value."""
+    from custom_components.milesight_gateway.api import _fleet_detail
+
+    detail = _fleet_detail(raw)
+
+    assert all(value is None for value in detail.values())

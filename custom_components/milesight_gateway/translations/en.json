@@ -132,12 +132,51 @@
                     "node": "Node (packet forwarder)",
                     "standalone": "Standalone"
                 }
+            },
+            "command_status": {
+                "name": "Command status",
+                "state": {
+                    "pending": "Pending",
+                    "retrying": "Retrying",
+                    "transmitted": "Delivered, waiting for ACK",
+                    "acknowledged": "Acknowledged",
+                    "confirmed": "Confirmed",
+                    "differs": "Reported differently",
+                    "sent": "Sent",
+                    "failed": "Failed"
+                }
+            },
+            "signal_quality": {
+                "name": "Signal quality",
+                "state": {
+                    "excellent": "Excellent",
+                    "good": "Good",
+                    "fair": "Fair",
+                    "poor": "Poor"
+                }
+            },
+            "packet_loss": {
+                "name": "Packet loss today"
+            },
+            "gateways_in_range": {
+                "name": "Gateways in range"
+            },
+            "battery_days_left": {
+                "name": "Battery days left"
+            }
+        },
+        "button": {
+            "sync_devices": {
+                "name": "Sync devices"
             }
         }
     },
     "exceptions": {
         "downlink_failed": {
             "message": "The gateway did not accept the command for the device: {error}"
+        },
+        "sync_failed": {
+            "message": "Cannot read the gateway's device list: {error}"
         }
     },
     "options": {
@@ -152,7 +191,14 @@
                     "data_source": "Data source",
                     "all_settings": "All device settings as entities",
                     "mqtt_topic": "MQTT topic of the devices",
-                    "network_panel": "Show the network map in the sidebar"
+                    "network_panel": "Show the network map in the sidebar",
+                    "devices_panel": "Show the device page in the sidebar",
+                    "mqtt_downlink_topic": "MQTT downlink topic",
+                    "mqtt_ack_topic": "MQTT ACK topic",
+                    "mqtt_error_topic": "MQTT error topic",
+                    "mqtt_join_topic": "MQTT join topic",
+                    "mqtt_request_topic": "MQTT request topic",
+                    "mqtt_response_topic": "MQTT response topic"
                 },
                 "data_description": {
                     "scan_interval": "How often the gateway is read: its device list, or for a gateway without one, whether it answers.",
@@ -161,9 +207,16 @@
                     "firmware_check": "Look up the newest gateway firmware on milesight.com twice a day.",
                     "devices": "Only these devices get entities. Leave empty for all devices. Devices you remove from the list are removed from Home Assistant with their entities.",
                     "data_source": "Where the devices' sensor values come from.",
-                    "all_settings": "LoRaWAN only. Every device always gets report interval, target temperature (thermostats), reboot and status request. Switched on, each device also gets an entity for every other setting its codec knows, about 25: alarms, thresholds, calibration. They start disabled; enable the ones you need.",
+                    "all_settings": "Every device always gets report interval, target temperature (thermostats), reboot and status request. Switched on, each device also gets an entity for every other setting its codec knows, about 25: alarms, thresholds, calibration. They start disabled; enable the ones you need.",
                     "mqtt_topic": "For example sensors/lora/uplink/{dev_eui}. {dev_eui} marks where the devEUI sits; any other placeholder in curly braces, or +, matches anything. Leave empty to show the gateway only.",
-                    "network_panel": "LoRaWAN only. One menu entry serves all gateways; switched off at any of them, it leaves the sidebar. The page keeps its address and the dashboard card still works."
+                    "network_panel": "LoRaWAN only. One menu entry serves all gateways; switched off at any of them, it leaves the sidebar. The page keeps its address and the dashboard card still works.",
+                    "devices_panel": "One menu entry serves all gateways; switched off at any of them, it leaves the sidebar. The page keeps its address, /milesight-devices.",
+                    "mqtt_downlink_topic": "The topic the gateway's application takes downlinks from, for example sensors/lora/downlink/{dev_eui}. Leave empty for no device settings.",
+                    "mqtt_ack_topic": "The topic the application reports ACKs of confirmed downlinks to, for example sensors/lora/ack/{dev_eui}. With it, a downlink without an ACK is sent again.",
+                    "mqtt_error_topic": "Where the application reports failed downlinks, for example sensors/lora/error/{dev_eui}.",
+                    "mqtt_join_topic": "Where the application reports joins, for example sensors/lora/join/{dev_eui}.",
+                    "mqtt_request_topic": "Where the network server takes API requests, exactly as set on the gateway, $deveui included. With the response topic, the device list comes from the gateway.",
+                    "mqtt_response_topic": "Where the network server answers API requests, exactly as set on the gateway."
                 },
                 "title": "Milesight LoRaWAN Gateway options"
             },
@@ -173,14 +226,15 @@
             }
         },
         "error": {
-            "invalid_topic": "The topic needs whole levels: {dev_eui} at most once, + or another placeholder only as a full level, no #."
+            "invalid_topic": "The topic needs whole levels: {dev_eui} at most once, + or another placeholder only as a full level, no #.",
+            "invalid_downlink_topic": "A downlink or ACK topic names one device: {dev_eui} exactly once, no + or #, no other placeholder."
         }
     },
     "selector": {
         "data_source": {
             "options": {
                 "lorawan": "LoRaWAN: reads the gateway's packet log and decodes with Milesight's own codecs. Needs no MQTT broker. Settings go to the devices through the gateway's network server, for every model Milesight publishes a codec for.",
-                "mqtt": "MQTT: takes what the gateway publishes, decoded by the payload codecs set up on the gateway. Needs an MQTT broker in Home Assistant. Settings go to the devices through the gateway's network server, for the models this integration describes itself."
+                "mqtt": "MQTT: takes what the gateway publishes, decoded by the payload codecs set up on the gateway. Needs an MQTT broker in Home Assistant. Settings go to the devices on the MQTT downlink topic of the gateway's application, and their ACK comes back on its ACK topic."
             }
         }
     }

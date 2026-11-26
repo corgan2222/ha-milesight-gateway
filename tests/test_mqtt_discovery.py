@@ -232,6 +232,9 @@ async def test_a_device_appears_with_its_first_uplink(hass, mqtt_mock, gateway):
     assert hass.states.get(_entity(hass, "sensor", "gw")).state == "Local Gateway"
     # The uplink's time is no state of the device.
     assert _entity(hass, "sensor", "timestamp") is None
+    # The topic carries no downlinks, so no setting gets an entity.
+    for domain in ("button", "number", "select", "switch"):
+        assert hass.states.async_entity_ids(domain) == []
 
 
 async def test_the_payload_names_the_device_when_the_topic_does_not(

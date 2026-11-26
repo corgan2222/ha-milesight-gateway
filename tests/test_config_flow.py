@@ -26,12 +26,13 @@ from custom_components.milesight_gateway.api import (
     APIConnectionError,
     GatewayDetails,
     GatewayInfo,
-    _build_device,
+    MilesightDevice,
 )
 from custom_components.milesight_gateway.const import (
     CONF_ALL_SETTINGS,
     CONF_DATA_SOURCE,
     CONF_DEVICES,
+    CONF_DEVICES_PANEL,
     CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
     CONF_GATEWAY_URL,
@@ -75,16 +76,10 @@ GET_INFO = (
 )
 # The second step's input: everything but the address, which the first takes.
 CREDENTIALS = {k: v for k, v in USER_INPUT.items() if k != CONF_GATEWAY_URL}
-THERMOSTAT = _build_device(
-    {"devEUI": "24E1247140000001", "name": "radiator"},
-    {"id": "wt101", "description": "Wireless Thermostat", "device_entities": []},
-    "sensors/lora/uplink",
+THERMOSTAT = MilesightDevice(
+    "24E1247140000001", "radiator", "Wireless Thermostat", "wt101"
 )
-BUTTON = _build_device(
-    {"devEUI": "24E1245350000002", "name": "button1"},
-    {"id": "ws101", "description": "Smart Button", "device_entities": []},
-    "sensors/lora/uplink",
-)
+BUTTON = MilesightDevice("24E1245350000002", "button1", "Smart Button", "ws101")
 
 
 @pytest.fixture(autouse=True)
@@ -544,6 +539,7 @@ async def test_options_flow_sets_status_and_sources(hass):
         CONF_DATA_SOURCE: SOURCE_LORAWAN,
         CONF_ALL_SETTINGS: True,
         CONF_NETWORK_PANEL: False,
+        CONF_DEVICES_PANEL: False,
     }
 
     with patch(

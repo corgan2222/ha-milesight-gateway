@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
@@ -12,7 +13,10 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from milesight_gateway_api import decoder
 from milesight_gateway_api.lorawan_devices import MilesightDevice
 
+from .commands import CommandTracker
 from .const import CONF_GATEWAY_URL, DOMAIN
+from .link import LinkStats
+from .settings import DEVICE, SettingsLog
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -49,6 +53,19 @@ class MilesightLoRaWANCoordinator(DataUpdateCoordinator[MilesightDevice]):
         self._versions: dict[str, str] = {}
         # The device hearing it best; the entry's gateway until an uplink tells.
         self._via = gateway_device_id
+        runtime = getattr(entry, "runtime_data", None)
+        self._settings: SettingsLog | None = getattr(runtime, "settings", None)
+        self.commands = CommandTracker(
+            hass, device, self._remember, getattr(runtime, "journal", None)
+        )
+        self._seed_settings(device)
+        self._settings_uplinks = device.uplinks
+        self.link = LinkStats()
+        # Field IDs with an entity before the restart; lorawan_entity.py.
+        self.registered: set[str] | None = None
+        # Settings of the pulse counters' meters, by counter field; meters.py.
+        self.meters: dict[str, dict[str, Any]] = {}
+        self._link_at: object = None
         self.async_set_updated_data(device)
         self._unsubscribe = device.add_update_listener(self._async_device_updated)
 
@@ -69,8 +86,56 @@ class MilesightLoRaWANCoordinator(DataUpdateCoordinator[MilesightDevice]):
 
     @callback
     def _async_device_updated(self) -> None:
+        self._record_uplink()
+        self._keep_reported()
+        self.commands.check()
+        battery = getattr(getattr(self.entry, "runtime_data", None), "battery", None)
+        if battery is not None and "battery" in self.data.values:
+            battery.add(device_eui(self.data), self.data.values["battery"])
         self._async_update_registry()
         self.async_set_updated_data(self.data)
+
+    def _remember(self, values: dict[str, Any], source: str) -> None:
+        if self._settings is not None:
+            self._settings.record(device_eui(self.data), values, source)
+
+    def _seed_settings(self, device: MilesightDevice) -> None:
+        """Bring back the settings kept before the restart."""
+        if self._settings is None:
+            return
+        for key, kept in self._settings.get(device_eui(device)).items():
+            if device.fields.get(key, {}).get("access") == "RW":
+                device.values.setdefault(key, kept["v"])
+
+    def _keep_reported(self) -> None:
+        """Keep the settings a new uplink reports."""
+        device = self.data
+        if device.uplinks == self._settings_uplinks:
+            return
+        self._settings_uplinks = device.uplinks
+        decoded = decoder.flatten(device.last_decoded)
+        self._remember(
+            {
+                key: value
+                for key, value in decoded.items()
+                if device.fields.get(key, {}).get("access") == "RW"
+            },
+            DEVICE,
+        )
+
+    def _record_uplink(self) -> None:
+        """Feed the link statistics with a new uplink, once."""
+        uplink = self.connection.last_uplinks.get(self.data.descriptor.dev_eui)
+        if uplink is None or uplink.received_at == self._link_at:
+            return
+        self._link_at = uplink.received_at
+        self.link.record(
+            uplink.received_at,
+            [(rx.gateway_id, rx.rssi, rx.snr) for rx in uplink.receptions],
+            # Only MQTT payloads carry these.
+            f_cnt=getattr(uplink, "f_cnt", None),
+            spreading_factor=getattr(uplink, "spreading_factor", None),
+        )
 
     @callback
     def _async_update_registry(self) -> None:
@@ -114,6 +179,18 @@ class MilesightLoRaWANCoordinator(DataUpdateCoordinator[MilesightDevice]):
             ):
                 return gateway.id
         return None
+
+    @callback
+    def rename(self, name: str) -> None:
+        """Take a name the gateway gave the device; one set in Home Assistant stays."""
+        if not name or name == self.data.descriptor.name:
+            return
+        self.data.descriptor = replace(self.data.descriptor, name=name)
+        registry = dr.async_get(self.hass)
+        if device := registry.async_get_device_by_identifier(
+            (DOMAIN, device_eui(self.data)), self.entry.entry_id
+        ):
+            registry.async_update_device(device.id, name=name)
 
     @callback
     def async_shutdown_listener(self) -> None:

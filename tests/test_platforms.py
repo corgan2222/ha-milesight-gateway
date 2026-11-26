@@ -22,6 +22,7 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
@@ -41,11 +42,11 @@ from custom_components.milesight_gateway.api import (
     FleetGateway,
     GatewayDetails,
     GatewayInfo,
+    MilesightDevice,
     MilesightGatewayAPI,
     NetworkStatus,
     Packet,
     SystemStatus,
-    _build_device,
     _packet,
 )
 from custom_components.milesight_gateway.const import (
@@ -65,32 +66,23 @@ from custom_components.milesight_gateway.const import (
 from custom_components.milesight_gateway.diagnostics import (
     async_get_config_entry_diagnostics,
 )
+from custom_components.milesight_gateway.fleet import FleetMembers, MemberStatus
 from custom_components.milesight_gateway.sensor import _tcp_ping
 
 from .test_init import ENTRY_DATA
 
 TOPIC = "sensors/lora/uplink/24e124123456789a"
-DEVICE = _build_device(
-    {"devEUI": "24E124123456789A", "name": "vs321"},
-    {
-        "id": "vs321",
-        "name": "VS321",
-        "description": "People counter",
-        "device_entities": [
-            "temperature",
-            "battery",
-            "people_total_counts",
-            "door",
-            "tamper",
-        ],
-    },
-    "sensors/lora/uplink",
+DEVICE = MilesightDevice("24E124123456789A", "vs321", "People counter", "vs321")
+# A full report, as the gateway's payload codec publishes it.
+REPORT = (
+    '{"temperature": 22.5, "battery": 90, "people_total_counts": 2, '
+    '"region_1_enable": "enable"}'
 )
 
 TEMPERATURE = "sensor.vs321_temperature"
-PEOPLE = "sensor.vs321_people_count"
+PEOPLE = "sensor.vs321_people_total_counts"
 OCCUPANCY = "binary_sensor.vs321_occupancy"
-DOOR = "binary_sensor.vs321_door"
+DOOR = "binary_sensor.vs321_region_1_enable"
 LAST_SEEN = "sensor.vs321_last_seen"
 ONLINE = "sensor.milesight_gateway_online_devices"
 OFFLINE = "sensor.milesight_gateway_offline_devices"
@@ -121,13 +113,13 @@ def firmware():
     installed = AsyncMock(
         return_value=GatewayInfo(model="UG65", firmware="60.0.0.48-r3")
     )
-    latest = AsyncMock(return_value=RELEASE)
+    latest = AsyncMock(return_value=[RELEASE])
     details = AsyncMock(return_value=DETAILS)
     with (
         patch.object(MilesightGatewayAPI, "async_get_gateway_info", installed),
         patch.object(MilesightGatewayAPI, "async_get_gateway_details", details),
         patch(
-            "custom_components.milesight_gateway.coordinator.async_get_latest_firmware",
+            "custom_components.milesight_gateway.coordinator.async_get_firmware_releases",
             latest,
         ),
     ):
@@ -247,16 +239,18 @@ async def _refresh(hass, entry: MockConfigEntry) -> None:
     await hass.async_block_till_done()
 
 
+async def _report(hass, payload: str = REPORT) -> None:
+    async_fire_mqtt_message(hass, TOPIC, payload)
+    await hass.async_block_till_done()
+
+
 async def test_entities_follow_the_mqtt_payload(hass, entry):
     """One uplink updates every entity of the device it is addressed to."""
-    assert hass.states.get(TEMPERATURE).state == STATE_UNKNOWN
+    assert hass.states.get(TEMPERATURE) is None
     assert hass.states.get(ONLINE).state == "1"
     assert hass.states.get(OFFLINE).state == "2"
 
-    async_fire_mqtt_message(
-        hass, TOPIC, '{"temperature": 22.5, "people_total_counts": 2, "door": "open"}'
-    )
-    await hass.async_block_till_done()
+    await _report(hass)
 
     assert hass.states.get(TEMPERATURE).state == "22.5"
     assert hass.states.get(PEOPLE).state == "2"
@@ -266,9 +260,10 @@ async def test_entities_follow_the_mqtt_payload(hass, entry):
 
 
 async def test_diagnostic_entities_are_categorized(hass, entry):
-    """Battery and tamper carry the diagnostic category from the mapping."""
+    """Identity fields and the radio values of a payload codec are diagnostic."""
+    await _report(hass, '{"sn": "6723A1", "rssi": -90}')
     registry = er.async_get(hass)
-    for entity_id in ("sensor.vs321_battery", "binary_sensor.vs321_tamper"):
+    for entity_id in ("sensor.vs321_sn", "sensor.vs321_rssi"):
         assert (
             registry.async_get(entity_id).entity_category is EntityCategory.DIAGNOSTIC
         )
@@ -277,28 +272,16 @@ async def test_diagnostic_entities_are_categorized(hass, entry):
 @pytest.mark.parametrize("payload", ["not json", "[1, 2]", '{"battery": 90}'])
 async def test_unusable_payloads_leave_the_state_alone(hass, entry, payload):
     """Broken JSON, a non-object and a payload without the key change nothing."""
-    async_fire_mqtt_message(hass, TOPIC, '{"temperature": 21, "door": "closed"}')
-    await hass.async_block_till_done()
-
-    async_fire_mqtt_message(hass, TOPIC, payload)
-    await hass.async_block_till_done()
+    await _report(hass, '{"temperature": 21, "region_1_enable": "disable"}')
+    await _report(hass, payload)
 
     assert hass.states.get(TEMPERATURE).state == "21"
     assert hass.states.get(DOOR).state == "off"
 
 
-async def test_unusable_payloads_are_logged(hass, entry, caplog):
-    """A payload that cannot be read is worth a warning."""
-    async_fire_mqtt_message(hass, TOPIC, "not json")
-    async_fire_mqtt_message(hass, TOPIC, "[1, 2]")
-    await hass.async_block_till_done()
-
-    assert f"Invalid JSON on topic {TOPIC}" in caplog.text
-    assert f"Unexpected payload on topic {TOPIC}" in caplog.text
-
-
 async def test_entities_follow_the_gateway_device_list(hass, entry, get_devices):
     """A device the gateway stops listing as active becomes unavailable."""
+    await _report(hass)
     get_devices.return_value = ([], 0, 3)
     await _refresh(hass, entry)
 
@@ -309,7 +292,7 @@ async def test_entities_follow_the_gateway_device_list(hass, entry, get_devices)
     get_devices.return_value = ([DEVICE], 1, 2)
     await _refresh(hass, entry)
 
-    assert hass.states.get(TEMPERATURE).state == STATE_UNKNOWN
+    assert hass.states.get(TEMPERATURE).state == "22.5"
 
 
 @pytest.mark.parametrize(
@@ -319,6 +302,7 @@ async def test_entities_are_unavailable_while_the_gateway_is_down(
     hass, entry, get_devices, error
 ):
     """Device and gateway entities all go unavailable when a refresh fails."""
+    await _report(hass)
     get_devices.side_effect = error
     await _refresh(hass, entry)
 
@@ -372,6 +356,7 @@ async def test_setup_retries_without_a_login(hass, mqtt, get_devices):
 
 async def test_unload(hass, entry):
     """The entry unloads cleanly and its entities go away with it."""
+    await _report(hass)
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
 
@@ -657,7 +642,7 @@ async def test_a_failed_status_leaves_the_devices_alone(hass, entry, status):
         hass.states.get("binary_sensor.milesight_gateway_packet_forwarder").state
         == STATE_UNAVAILABLE
     )
-    assert hass.states.get(TEMPERATURE).state == STATE_UNKNOWN
+    assert hass.states.get(LAST_SEEN).state == STATE_UNKNOWN
 
 
 async def test_an_unreadable_web_interface_keeps_the_network_status(
@@ -688,6 +673,18 @@ async def test_a_status_that_was_never_read_creates_only_fixed_entities(
     assert hass.states.get("sensor.vs321_spreading_factor").state == STATE_UNAVAILABLE
     assert hass.states.get("binary_sensor.milesight_gateway_mqtt_cloud_home") is None
     assert hass.states.get("binary_sensor.milesight_gateway_radio") is None
+
+    # The status answers later: links and fleet gateways arrive then.
+    status[0].side_effect = None
+    await entry.runtime_data.diagnostics.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.milesight_gateway_mqtt_cloud_home").state == (
+        "on"
+    )
+    assert hass.states.get("sensor.shed_radio_last_seen") is not None
+    # Unloading after that must not stop the listener a second time.
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.NOT_LOADED
 
 
 async def _entry_with(hass, options: dict) -> MockConfigEntry:
@@ -736,7 +733,6 @@ async def test_diagnostics_help_without_giving_anything_away(hass, entry):
 
     assert diagnostics["device_list"]["online"] == 1
     assert diagnostics["device_list"]["matched"][0]["model_id"] == "vs321"
-    assert "binary_sensor.door" in diagnostics["device_list"]["matched"][0]["entities"]
     assert diagnostics["status"]["network"]["codec_count"] == 162
     assert diagnostics["status"]["network"]["packets_in_window"] == 1
     assert diagnostics["gateway_device"]["sw_version"] == "60.0.0.48-r3"
@@ -839,7 +835,7 @@ async def test_a_failed_firmware_check_does_not_block_setup(
 
     assert entry.state is ConfigEntryState.LOADED
     assert hass.states.get(FIRMWARE).state == STATE_UNAVAILABLE
-    assert hass.states.get(TEMPERATURE).state == STATE_UNKNOWN
+    assert hass.states.get(LAST_SEEN).state == STATE_UNKNOWN
 
 
 async def test_gateway_only_entry_never_tries_the_network_login(
@@ -900,3 +896,238 @@ async def test_gateway_only_entry_never_tries_the_network_login(
     assert (dr.CONNECTION_NETWORK_MAC, "24:e1:24:00:00:01") in _gateway_device(
         hass, entry
     ).connections
+
+
+STEP = FirmwareRelease(
+    version="60.0.0.45",
+    title="UG65&UG67 LoRaWAN® Gateway",
+    release_url=None,
+    download_url="https://resource.milesight.com/milesight/iot/firmware/60.0.0.45.bin",
+    notes="Please reset the gateway if you would like to downgrade to this version.",
+)
+NEWEST = FirmwareRelease(
+    version="60.0.0.51",
+    title="UG65&UG67 LoRaWAN® Gateway",
+    release_url=None,
+    download_url="https://resource.milesight.com/milesight/iot/firmware/60.0.0.51.bin",
+    notes="Ensure that your gateway is updated to v60.0.0.45 or later.",
+    requires="60.0.0.45",
+)
+
+
+async def _setup_on(hass, firmware, installed: str) -> MockConfigEntry:
+    firmware[0].return_value = GatewayInfo(model="UG65", firmware=installed)
+    firmware[1].return_value = [STEP, NEWEST]
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, version=1, minor_version=2)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+async def test_a_gateway_below_the_minimum_is_offered_the_step_first(
+    hass, mqtt, get_devices, firmware
+):
+    """The newest firmware would fail on it; Milesight names what to install first."""
+    await _setup_on(hass, firmware, "60.0.0.44")
+
+    state = hass.states.get(FIRMWARE)
+    assert state.state == STATE_ON
+    assert state.attributes["latest_version"] == "60.0.0.45"
+    assert state.attributes["release_summary"].startswith(
+        "Step towards 60.0.0.51: Milesight requires 60.0.0.45 first."
+    )
+
+
+async def test_installing_backs_up_downloads_uploads_and_waits(
+    hass, mqtt, get_devices, firmware
+):
+    """One step per call, the backup before anything is changed."""
+    await _setup_on(hass, firmware, "60.0.0.45")
+    assert hass.states.get(FIRMWARE).attributes["latest_version"] == "60.0.0.51"
+    calls: list[str] = []
+
+    async def backup(_self, _session):
+        calls.append("backup")
+        return b"backup"
+
+    def save(_folder, url, version, data):
+        calls.append(f"save {version} {data!r}")
+        return "/config/x.backup"
+
+    async def download(_session, release):
+        calls.append(f"download {release.version}")
+        return b"image"
+
+    async def upload(_self, _session, image):
+        calls.append(f"upload {image!r}")
+        # The gateway comes back on the new firmware.
+        firmware[0].return_value = GatewayInfo(model="UG65", firmware="60.0.0.51")
+
+    with (
+        patch.object(MilesightGatewayAPI, "async_download_backup", backup),
+        patch.object(MilesightGatewayAPI, "async_upgrade_firmware", upload),
+        patch("custom_components.milesight_gateway.coordinator.save_backup", save),
+        patch(
+            "custom_components.milesight_gateway.coordinator.async_download_firmware",
+            download,
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.asyncio.sleep", AsyncMock()
+        ),
+    ):
+        await hass.services.async_call(
+            "update", "install", {"entity_id": FIRMWARE}, blocking=True
+        )
+        await hass.async_block_till_done()
+
+    assert calls == [
+        "backup",
+        "save 60.0.0.45 b'backup'",
+        "download 60.0.0.51",
+        "upload b'image'",
+    ]
+    state = hass.states.get(FIRMWARE)
+    assert state.attributes["installed_version"] == "60.0.0.51"
+    assert state.state == "off"
+
+
+async def test_a_failed_backup_stops_the_installation(
+    hass, mqtt, get_devices, firmware
+):
+    """Without a backup nothing is uploaded."""
+    await _setup_on(hass, firmware, "60.0.0.45")
+    upload = AsyncMock()
+
+    with (
+        patch.object(
+            MilesightGatewayAPI,
+            "async_download_backup",
+            AsyncMock(side_effect=APIConnectionError("no backup")),
+        ),
+        patch.object(MilesightGatewayAPI, "async_upgrade_firmware", upload),
+        pytest.raises(HomeAssistantError, match="not installed"),
+    ):
+        await hass.services.async_call(
+            "update", "install", {"entity_id": FIRMWARE}, blocking=True
+        )
+
+    upload.assert_not_awaited()
+
+
+async def test_the_end_of_life_ug63_is_not_offered_an_installation(
+    hass, mqtt, get_devices, firmware
+):
+    """Milesight publishes nothing for it, and its upload was never tried."""
+    await _setup_on(hass, firmware, "63.0.0.2-r2")
+
+    # Only the release notes are left; 1 is the installation.
+    assert not hass.states.get(FIRMWARE).attributes["supported_features"] & 1
+
+
+SHED = "24E124FFFE000001"
+SHED_FIRMWARE = "update.shed_firmware"
+
+
+def _member(version: str | None) -> MemberStatus:
+    return MemberStatus(
+        system=None,
+        firmware=version,
+        wifi_enabled=None,
+        wifi_ssid=None,
+        wifi_access_point=None,
+        wireguard=(),
+    )
+
+
+async def test_a_fleet_member_is_offered_its_own_step(
+    hass, mqtt, get_devices, firmware, fleet_members
+):
+    """The hub is past the minimum version, the member is not."""
+    fleet_members.return_value = {SHED: _member("60.0.0.44")}
+    await _setup_on(hass, firmware, "60.0.0.51")
+
+    assert hass.states.get(FIRMWARE).state == "off"
+    state = hass.states.get(SHED_FIRMWARE)
+    assert state.state == STATE_ON
+    assert state.attributes["installed_version"] == "60.0.0.44"
+    assert state.attributes["latest_version"] == "60.0.0.45"
+    assert state.attributes["supported_features"]
+
+
+async def test_a_member_of_another_family_gets_no_offer(
+    hass, mqtt, get_devices, firmware, fleet_members
+):
+    """The releases read for the hub say nothing about another product line."""
+    fleet_members.return_value = {SHED: _member("56.0.0.3")}
+    await _setup_on(hass, firmware, "60.0.0.51")
+
+    state = hass.states.get(SHED_FIRMWARE)
+    assert state.attributes["installed_version"] == "56.0.0.3"
+    assert state.attributes["latest_version"] is None
+
+
+async def test_installing_on_a_member_goes_through_its_own_web_interface(
+    hass, mqtt, get_devices, firmware, fleet_members
+):
+    """Backup and upload at the member, not at the hub."""
+    fleet_members.return_value = {SHED: _member("60.0.0.45")}
+    await _setup_on(hass, firmware, "60.0.0.51")
+    member = MagicMock()
+    member.async_download_backup = AsyncMock(return_value=b"backup")
+    member.async_get_gateway_info = AsyncMock(
+        return_value=GatewayInfo(model="UG65", firmware="60.0.0.51")
+    )
+
+    async def upload(_session, _image):
+        fleet_members.return_value = {SHED: _member("60.0.0.51")}
+
+    member.async_upgrade_firmware = AsyncMock(side_effect=upload)
+    hub_upload = AsyncMock()
+    save = MagicMock(return_value="/config/x.backup")
+
+    with (
+        patch.object(FleetMembers, "api", return_value=member) as api,
+        patch.object(MilesightGatewayAPI, "async_upgrade_firmware", hub_upload),
+        patch("custom_components.milesight_gateway.coordinator.save_backup", save),
+        patch(
+            "custom_components.milesight_gateway.coordinator.async_download_firmware",
+            AsyncMock(return_value=b"image"),
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.asyncio.sleep", AsyncMock()
+        ),
+    ):
+        await hass.services.async_call(
+            "update", "install", {"entity_id": SHED_FIRMWARE}, blocking=True
+        )
+        await hass.async_block_till_done()
+
+    api.assert_called_once_with(SHED)
+    member.async_download_backup.assert_awaited_once()
+    assert save.call_args.args[2:] == ("60.0.0.45", b"backup")
+    assert member.async_upgrade_firmware.await_args.args[1] == b"image"
+    hub_upload.assert_not_awaited()
+    state = hass.states.get(SHED_FIRMWARE)
+    assert state.attributes["installed_version"] == "60.0.0.51"
+    assert state.state == "off"
+
+
+async def test_the_dialog_gets_the_notes_in_full(
+    hass, mqtt, get_devices, firmware, hass_ws_client
+):
+    """The state holds 255 characters of them; Milesight writes more."""
+    notes = "\n".join(f"{n}. A note about this firmware release." for n in range(1, 12))
+    firmware[0].return_value = GatewayInfo(model="UG65", firmware="60.0.0.45")
+    firmware[1].return_value = [replace(NEWEST, notes=notes)]
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, version=1, minor_version=2)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(hass.states.get(FIRMWARE).attributes["release_summary"]) == 255
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": "update/release_notes", "entity_id": FIRMWARE}
+    )
+    assert (await client.receive_json())["result"] == notes

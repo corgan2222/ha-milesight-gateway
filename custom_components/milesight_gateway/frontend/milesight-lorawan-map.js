@@ -414,6 +414,8 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
         ${card ? ".card-only { display: inline; }" : ".panel-only { display: inline; }"}
         header { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--divider-color); }
         h1 { font-size: 20px; font-weight: 400; margin: 0 16px 0 0; }
+        h1 a { color: inherit; text-decoration: none; }
+        h1 a:hover { text-decoration: underline; }
         .legend { display: flex; gap: 12px; font-size: 13px; color: var(--secondary-text-color); align-items: center; flex-wrap: wrap; }
         .swatch { display: inline-block; width: 18px; height: 4px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
         .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
@@ -438,7 +440,7 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
         #fps { font-variant-numeric: tabular-nums; min-width: 230px; }
       </style>
       <header>
-        ${title ? `<h1>${title.replace(/[<>&]/g, "")}</h1>` : ""}
+        ${title ? `<h1>${card ? title.replace(/[<>&]/g, "") : `<a id="home" href="/config/integrations/integration/milesight_gateway" title="Open the integration">${title.replace(/[<>&]/g, "")}</a>`}</h1>` : ""}
         <div class="legend">${QUALITY.map((q) => `<span><span class="swatch" style="background:${q.color}"></span>${q.name}</span>`).join("")}
           <span class="panel-only">good: RSSI ≥ −100 dBm and SNR ≥ 0 dB</span>
           <span><span class="dot" style="background:${DEVICE_COLOR.waiting}"></span>no uplink yet</span>
@@ -463,6 +465,15 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
       </header>
       <svg id="canvas" xmlns="${SVG}"><g id="viewport"><g id="links"></g><g id="linklabels"></g><g id="nodes"></g></g></svg>`;
     const root = this.shadowRoot;
+    const home = root.getElementById("home");
+    if (home) {
+      home.addEventListener("click", (ev) => {
+        // Home Assistant's own navigation: no reload of the whole frontend.
+        ev.preventDefault();
+        history.pushState(null, "", home.getAttribute("href"));
+        window.dispatchEvent(new CustomEvent("location-changed"));
+      });
+    }
     root.getElementById("toggle").addEventListener("click", (ev) => {
       this._toolsOpen = !this._toolsOpen;
       writeStorage(TOOLS_KEY, this._toolsOpen);

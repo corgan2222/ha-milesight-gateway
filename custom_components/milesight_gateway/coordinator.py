@@ -7,9 +7,12 @@ Actual sensor state updates are delivered via MQTT (push), not here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.const import (
@@ -18,11 +21,12 @@ from homeassistant.const import (
     CONF_SCAN_INTERVAL,
     CONF_USERNAME,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
+from milesight_gateway_api import next_firmware
 
 from .api import (
     APIAuthError,
@@ -35,12 +39,13 @@ from .api import (
     NetworkStatus,
     Packet,
     SystemStatus,
-    async_get_latest_firmware,
+    async_download_firmware,
+    async_get_firmware_releases,
 )
 from .const import (
+    BACKUP_FOLDER,
     CONF_DEVICES,
     CONF_FIRMWARE_CHECK,
-    CONF_GATEWAY_MQTT_BASE_TOPIC,
     CONF_GATEWAY_URL,
     CONF_IV,
     CONF_SECRET_KEY,
@@ -49,12 +54,16 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     FIRMWARE_RETRY_INTERVAL,
     FIRMWARE_SCAN_INTERVAL,
+    UPGRADE_POLL_SECONDS,
+    UPGRADE_TIMEOUT_SECONDS,
+    WEB_ONLY_FIRMWARE,
     gateway_only,
 )
+from .fleet import FleetMembers, MemberStatus
 from .hostname import learn_hostname
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from aiohttp import ClientSession
     from homeassistant.config_entries import ConfigEntry
@@ -137,7 +146,6 @@ class MilesightGatewayCoordinator(DataUpdateCoordinator[MilesightGatewayData]):
             password=config_entry.data[CONF_PASSWORD],
             secret_key=config_entry.data[CONF_SECRET_KEY],
             iv=config_entry.data[CONF_IV],
-            mqtt_base_topic=config_entry.data[CONF_GATEWAY_MQTT_BASE_TOPIC],
         )
         self.gateway_only = gateway_only(config_entry.data)
 
@@ -195,6 +203,83 @@ class FirmwareData:
 
     installed: str
     latest: FirmwareRelease | None
+    # The release to install next on the way to the newest: the newest
+    # itself, or one it requires first. None when nothing can be installed.
+    step: FirmwareRelease | None = None
+    # Every release of the gateway's family, oldest first; fleet members of
+    # the same family find their own next step in it.
+    releases: list[FirmwareRelease] = field(default_factory=list)
+
+
+def firmware_family(version: str) -> str:
+    """Return the product family a firmware version starts with, such as 60."""
+    return version.split(".", maxsplit=1)[0]
+
+
+async def async_install_firmware(  # noqa: PLR0913
+    hass: HomeAssistant,
+    api: MilesightGatewayAPI,
+    *,
+    address: str,
+    installed: str,
+    step: FirmwareRelease,
+    progress: Callable[[int], None],
+) -> None:
+    """
+    Install one firmware release on a gateway: backup, download, upload, wait.
+
+    The backup comes first and is kept under the configuration folder; without
+    it nothing is uploaded.
+    """
+    session: ClientSession = async_get_clientsession(hass)
+    try:
+        progress(5)
+        backup = await api.async_download_backup(session)
+        saved = await hass.async_add_executor_job(
+            save_backup, hass.config.path(BACKUP_FOLDER), address, installed, backup
+        )
+        _LOGGER.info("Backup of the gateway before the upgrade: %s", saved)
+        progress(20)
+        image = await async_download_firmware(session, step)
+        progress(50)
+        await api.async_upgrade_firmware(session, image)
+        progress(70)
+        await _async_wait_for(api, session, step.version)
+    except (APIAuthError, APIConnectionError, OSError) as err:
+        msg = f"The firmware was not installed: {err}"
+        raise HomeAssistantError(msg) from err
+
+
+async def _async_wait_for(
+    api: MilesightGatewayAPI, session: ClientSession, version: str
+) -> None:
+    """Wait until the gateway answers with the new version."""
+    waited = 0
+    while waited < UPGRADE_TIMEOUT_SECONDS:
+        await asyncio.sleep(UPGRADE_POLL_SECONDS)
+        waited += UPGRADE_POLL_SECONDS
+        try:
+            info = await api.async_get_gateway_info(session)
+        except APIAuthError, APIConnectionError:
+            continue  # it is installing or rebooting
+        if info.firmware == version:
+            return
+    msg = f"The gateway did not come back with firmware {version}"
+    raise APIConnectionError(msg)
+
+
+def save_backup(folder: str, gateway_url: str, firmware: str, backup: bytes) -> str:
+    """Write a gateway backup under the configuration folder and return its path."""
+    host = re.sub(
+        r"[^A-Za-z0-9.-]+", "_", gateway_url.rsplit("://", maxsplit=1)[-1]
+    ).strip("_")
+    stamp = dt_util.now().strftime("%Y%m%d-%H%M%S")
+    path = Path(folder) / f"{host}-fw{firmware}-{stamp}.backup"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The whole configuration, keys and passwords included.
+    path.write_bytes(backup)
+    path.chmod(0o600)
+    return str(path)
 
 
 class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
@@ -219,6 +304,7 @@ class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
         self._gateway_device_id = gateway_device_id
         self._web_data = web_data_enabled(config_entry.options)
         self._check_firmware = firmware_check_enabled(config_entry.options)
+        self.installing = False
 
     async def _async_update_data(self) -> FirmwareData:
         """Read the installed version, then look up the newest of its family."""
@@ -228,11 +314,13 @@ class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
             details = await self._async_get_details(session)
             # Before the download page, so the device is right even if that fails.
             self._update_gateway_device(info, details)
-            latest = (
-                await async_get_latest_firmware(session, info.firmware.split(".")[0])
+            releases = (
+                await async_get_firmware_releases(
+                    session, firmware_family(info.firmware)
+                )
                 if self._check_firmware
                 else None
-            )
+            ) or []
         except (APIAuthError, APIConnectionError) as err:
             # A busy start (a fleet hub loading hundreds of devices) can time
             # this out; without a retry the entity would wait 12 hours.
@@ -240,7 +328,46 @@ class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
             msg = f"Cannot read the firmware versions: {err}"
             raise UpdateFailed(msg) from err
         self.update_interval = FIRMWARE_SCAN_INTERVAL
-        return FirmwareData(installed=info.firmware, latest=latest)
+        return FirmwareData(
+            installed=info.firmware,
+            latest=releases[-1] if releases else None,
+            step=next_firmware(info.firmware, releases),
+            releases=releases,
+        )
+
+    @property
+    def can_install(self) -> bool:
+        """Whether the web interface, which takes the image, may be used."""
+        if self.data and firmware_family(self.data.installed) in WEB_ONLY_FIRMWARE:
+            # The UG63 with the internal antenna is end of life: Milesight
+            # publishes no firmware for it, and its upload was never tried.
+            return False
+        return self._web_data and not self.api.web_login_refused
+
+    async def async_install(self, progress: Callable[[int], None]) -> None:
+        """
+        Install the next firmware step: backup, download, upload, wait.
+
+        One step per call. A gateway below the version the newest firmware
+        requires gets that version first and the newest with the next call.
+        """
+        step = self.data.step if self.data else None
+        if step is None or self.installing:
+            msg = "There is no firmware to install, or an installation is running"
+            raise HomeAssistantError(msg)
+        self.installing = True
+        try:
+            await async_install_firmware(
+                self.hass,
+                self.api,
+                address=self.config_entry.data[CONF_GATEWAY_URL],
+                installed=self.data.installed,
+                step=step,
+                progress=progress,
+            )
+        finally:
+            self.installing = False
+        await self.async_refresh()
 
     async def _async_get_details(self, session: ClientSession) -> GatewayDetails | None:
         """Read the details behind the web login, if allowed and not refused."""
@@ -284,6 +411,8 @@ class DiagnosticsData:
     downlinks_per_minute: float | None
     # The newest uplink of each device, for its spreading factor and frequency.
     last_uplinks: dict[str, Packet]
+    # What each fleet member's own web interface reports, by gateway EUI.
+    members: dict[str, MemberStatus] = field(default_factory=dict)
 
 
 class MilesightDiagnosticsCoordinator(DataUpdateCoordinator[DiagnosticsData]):
@@ -308,6 +437,7 @@ class MilesightDiagnosticsCoordinator(DataUpdateCoordinator[DiagnosticsData]):
         self.api = api
         self.web_data = web_data_enabled(config_entry.options)
         self.gateway_only = gateway_only(config_entry.data)
+        self.members = FleetMembers(api)
         self._seen_packets: set[tuple[str, ...]] = set()
         self._last_refresh: datetime | None = None
         self._last_uplinks: dict[str, Packet] = {}
@@ -339,6 +469,13 @@ class MilesightDiagnosticsCoordinator(DataUpdateCoordinator[DiagnosticsData]):
             except APIAuthError as err:
                 _LOGGER.debug("Cannot read the gateway system status: %s", err)
 
+        members: dict[str, MemberStatus] = {}
+        if self.web_data:
+            # The option that keeps the web interface alone covers the members'.
+            members = await self.members.async_read(
+                session, network.gateways, network.gateway_eui
+            )
+
         now = dt_util.utcnow()
         new = [p for p in network.packets if p.key not in self._seen_packets]
         uplinks = downlinks = None
@@ -361,4 +498,5 @@ class MilesightDiagnosticsCoordinator(DataUpdateCoordinator[DiagnosticsData]):
             uplinks_per_minute=uplinks,
             downlinks_per_minute=downlinks,
             last_uplinks=dict(self._last_uplinks),
+            members=members,
         )

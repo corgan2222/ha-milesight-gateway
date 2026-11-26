@@ -1,10 +1,8 @@
 """
 Sensor entities for the Milesight Gateway integration.
 
-Entities are created from the device list provided by the coordinator.
-LoRaWAN sensor state updates are received via MQTT — no polling.
-Gateway diagnostic sensors (online/offline count, ping) use the coordinator
-or poll independently.
+Gateway sensors read the coordinators; the device sensors come from the
+codec catalog, as devices report (see lorawan_platforms).
 """
 
 from __future__ import annotations
@@ -13,7 +11,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -26,6 +24,7 @@ from homeassistant.components.sensor import (
 from homeassistant.const import (
     CONF_PORT,
     PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfFrequency,
     UnitOfTime,
 )
@@ -35,7 +34,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from . import lorawan_platforms
+from . import lorawan_platforms, meters
 from .api import FLEET_MASTER, FLEET_NODE, FLEET_STANDALONE
 from .const import CONF_GATEWAY_URL, DOMAIN, gateway_only
 from .coordinator import (
@@ -43,21 +42,17 @@ from .coordinator import (
     MilesightDiagnosticsCoordinator,
     MilesightGatewayCoordinator,
 )
-from .entity import (
-    MilesightDeviceEntity,
-    fleet_device_info,
-    remove_switched_off_entity,
-)
+from .entity import fleet_device_info, on_first_status, remove_switched_off_entity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from homeassistant.components.mqtt.models import ReceiveMessage
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
     from homeassistant.helpers.typing import StateType
 
     from . import MilesightGatewayConfigEntry
-    from .api import EntityDefinition, FleetGateway, MilesightDevice, Packet
+    from .api import FleetGateway, Packet
+    from .fleet import MemberStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,19 +114,6 @@ async def async_setup_entry(
             MilesightOfflineDevicesSensor(coordinator, gateway_device_info),
         ]
 
-    # The LoRaWAN source, or MQTT for a gateway-only entry, adds its device
-    # sensors below, as devices report.
-    lorawan = config_entry.runtime_data.devices is not None
-    for device in () if lorawan else coordinator.data.devices:
-        entities.extend(
-            MilesightSensor(coordinator, device, entity_def, gateway_url, gateway_id)
-            for entity_def in device.entities
-            if entity_def.platform == "sensor"
-        )
-        entities.append(
-            MilesightLastSeenSensor(coordinator, device, gateway_url, gateway_id)
-        )
-
     diagnostics = config_entry.runtime_data.diagnostics
     for description in GATEWAY_STATUS_SENSORS:
         # Web values need the web option; the others the network server login.
@@ -142,30 +124,67 @@ async def async_setup_entry(
             )
         else:
             remove_switched_off_entity(hass, "sensor", f"{entry_id}_{description.key}")
+    # The full description, so the device exists whichever entity comes first.
+    runtime = config_entry.runtime_data.devices
+    described = {
+        eui.upper(): device.device_info
+        for eui, device in (runtime.coordinators.items() if runtime else ())
+    }
     for device in coordinator.data.devices:
+        if runtime is not None and device.dev_eui.upper() not in described:
+            continue  # another entry has the device, or it has no model
         entities.extend(
-            MilesightRadioSensor(diagnostics, description, device.dev_eui)
+            MilesightRadioSensor(
+                diagnostics,
+                description,
+                device.dev_eui,
+                described.get(device.dev_eui.upper()),
+            )
             for description in RADIO_SENSORS
         )
-    # Gateways in the fleet are only known once the status was read.
-    if diagnostics.data is not None:
-        network = diagnostics.data.network
-        entities.extend(
-            MilesightFleetLastSeenSensor(
-                diagnostics,
-                gateway,
-                entry_id,
-                gateway_id,
-                local=gateway.eui == network.gateway_eui,
-            )
-            for gateway in network.gateways
-        )
-
     async_add_entities(entities)
-    if lorawan:
+    # Gateways in the fleet are only known once the status was read.
+    on_first_status(
+        config_entry,
+        diagnostics,
+        lambda data: (
+            [
+                MilesightFleetLastSeenSensor(
+                    diagnostics,
+                    gateway,
+                    entry_id,
+                    gateway_id,
+                    local=gateway.eui == data.network.gateway_eui,
+                )
+                for gateway in data.network.gateways
+            ]
+            + [
+                MilesightFleetValueSensor(
+                    diagnostics, gateway, entry_id, gateway_id, description
+                )
+                for gateway in data.network.gateways
+                if gateway.eui != data.network.gateway_eui
+                for description in FLEET_VALUES
+            ]
+            + [
+                MilesightFleetMemberSensor(
+                    diagnostics, gateway, entry_id, gateway_id, description
+                )
+                for gateway in data.network.gateways
+                # The gateway itself has these from its own status already.
+                if gateway.eui in data.members
+                and gateway.eui != data.network.gateway_eui
+                for description in MEMBER_VALUES
+            ]
+        ),
+        async_add_entities,
+    )
+    # Device sensors come as devices report.
+    if config_entry.runtime_data.devices is not None:
         await lorawan_platforms.async_setup_sensors(
             hass, config_entry, async_add_entities
         )
+        meters.setup_sensors(config_entry, async_add_entities)
 
 
 # ---------------------------------------------------------------------------
@@ -267,82 +286,6 @@ class MilesightGatewayPingSensor(
     async def _async_ping(self) -> None:
         """Run the TCP ping and update state."""
         self._attr_native_value = await _tcp_ping(self._host, self._port)
-        self.async_write_ha_state()
-
-
-# ---------------------------------------------------------------------------
-# Per-device sensors (MQTT-driven)
-# ---------------------------------------------------------------------------
-
-
-class MilesightSensor(MilesightDeviceEntity, SensorEntity):
-    """A sensor whose state is updated via MQTT."""
-
-    def __init__(
-        self,
-        coordinator: MilesightGatewayCoordinator,
-        device: MilesightDevice,
-        entity_def: EntityDefinition,
-        configuration_url: str,
-        gateway_id: str,
-    ) -> None:
-        """Initialize the sensor from the entity definition provided by the API."""
-        super().__init__(coordinator, device, configuration_url, gateway_id)
-        self._entity_key = entity_def.key
-
-        self._attr_unique_id = f"{device.dev_eui}_{entity_def.key}"
-        self._attr_name = entity_def.name
-        self._attr_native_unit_of_measurement = entity_def.unit
-        self._attr_device_class = entity_def.device_class
-        self._attr_state_class = (
-            SensorStateClass(entity_def.state_class) if entity_def.state_class else None
-        )
-        self._attr_entity_registry_enabled_default = entity_def.enabled_by_default
-
-        if entity_def.icon:
-            self._attr_icon = entity_def.icon
-
-        if entity_def.entity_category:
-            self._attr_entity_category = EntityCategory(entity_def.entity_category)
-
-    @callback
-    def _handle_mqtt_message(self, msg: ReceiveMessage) -> None:
-        """Parse incoming MQTT payload and update state."""
-        value = self._read_value(msg, self._entity_key)
-        if value is None:
-            _LOGGER.debug(
-                "Key %s not found in payload for topic %s",
-                self._entity_key,
-                self._data_topic,
-            )
-            return
-
-        self._attr_native_value = value
-        self.async_write_ha_state()
-
-
-class MilesightLastSeenSensor(MilesightDeviceEntity, SensorEntity):
-    """Timestamp sensor that updates whenever any MQTT message arrives for a device."""
-
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_name = "Last seen"
-
-    def __init__(
-        self,
-        coordinator: MilesightGatewayCoordinator,
-        device: MilesightDevice,
-        configuration_url: str,
-        gateway_id: str,
-    ) -> None:
-        """Initialize the last-seen sensor."""
-        super().__init__(coordinator, device, configuration_url, gateway_id)
-        self._attr_unique_id = f"{device.dev_eui}_last_seen"
-
-    @callback
-    def _handle_mqtt_message(self, _msg: ReceiveMessage) -> None:
-        """Update the last-seen timestamp on every incoming message."""
-        self._attr_native_value = datetime.now(UTC)
         self.async_write_ha_state()
 
 
@@ -547,13 +490,16 @@ class MilesightRadioSensor(
         coordinator: MilesightDiagnosticsCoordinator,
         description: RadioDescription,
         dev_eui: str,
+        device_info: DeviceInfo | None = None,
     ) -> None:
         """Attach the value to the device."""
         super().__init__(coordinator)
         self.entity_description = description
         self._dev_eui = dev_eui.lower()
         self._attr_unique_id = f"{dev_eui}_{description.key}"
-        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, dev_eui)})
+        self._attr_device_info = device_info or DeviceInfo(
+            identifiers={(DOMAIN, dev_eui)}
+        )
 
     @property
     def native_value(self) -> StateType:
@@ -604,3 +550,171 @@ class MilesightFleetLastSeenSensor(
         # ponytail: assumes the gateway's clock zone matches Home Assistant's,
         # since the API gives no zone; add an option if that ever differs.
         return gateway.last_seen.replace(tzinfo=dt_util.get_default_time_zone())
+
+
+def _fleet_boot(gateway: FleetGateway) -> datetime | None:
+    """Return when a fleet member started, to the minute so it does not jitter."""
+    if gateway.uptime is None:
+        return None
+    booted = dt_util.utcnow() - timedelta(seconds=gateway.uptime)
+    return booted.replace(second=0, microsecond=0)
+
+
+@dataclass(frozen=True, kw_only=True)
+class FleetValueDescription(SensorEntityDescription):
+    """A value the hub knows of a fleet member."""
+
+    value_fn: Callable[[FleetGateway], datetime | str | int | None]
+
+
+# The hub's network server reports these of every other gateway of its fleet.
+FLEET_VALUES = (
+    FleetValueDescription(
+        key="ip_address",
+        name="IP address",
+        value_fn=lambda gateway: gateway.ip,
+    ),
+    FleetValueDescription(
+        key="last_boot",
+        name="Last boot",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=_fleet_boot,
+    ),
+    FleetValueDescription(
+        key="cellular_signal",
+        name="Cellular signal",
+        device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+        native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+        state_class=SensorStateClass.MEASUREMENT,
+        # Most gateways carry no SIM: off until someone wants it.
+        entity_registry_enabled_default=False,
+        value_fn=lambda gateway: gateway.cellular_signal,
+    ),
+)
+
+
+class MilesightFleetValueSensor(
+    CoordinatorEntity[MilesightDiagnosticsCoordinator], SensorEntity
+):
+    """One value of a fleet member, as the hub reports it."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    entity_description: FleetValueDescription
+
+    def __init__(
+        self,
+        coordinator: MilesightDiagnosticsCoordinator,
+        gateway: FleetGateway,
+        entry_id: str,
+        gateway_id: str,
+        description: FleetValueDescription,
+    ) -> None:
+        """Attach the value to the member's device."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._eui = gateway.eui
+        self._attr_unique_id = f"{entry_id}_{gateway.eui}_{description.key}"
+        self._attr_device_info = fleet_device_info(
+            gateway, entry_id, gateway_id, local=False
+        )
+
+    @property
+    def native_value(self) -> datetime | str | int | None:
+        """Return the value, None while the hub does not tell."""
+        data = self.coordinator.data
+        gateway = (
+            next((gw for gw in data.network.gateways if gw.eui == self._eui), None)
+            if data
+            else None
+        )
+        return self.entity_description.value_fn(gateway) if gateway else None
+
+
+@dataclass(frozen=True, kw_only=True)
+class MemberValueDescription(SensorEntityDescription):
+    """A value a fleet member's own web interface reports."""
+
+    value_fn: Callable[[MemberStatus], StateType]
+
+
+def _member_system(attr: str) -> Callable[[MemberStatus], StateType]:
+    return lambda member: getattr(member.system, attr) if member.system else None
+
+
+MEMBER_VALUES = (
+    MemberValueDescription(
+        key="cpu_load",
+        name="CPU load",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_member_system("cpu_load"),
+    ),
+    MemberValueDescription(
+        key="memory_available",
+        name="Memory available",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_member_system("memory_available"),
+    ),
+    MemberValueDescription(
+        key="storage_available",
+        name="Storage available",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=_member_system("storage_available"),
+    ),
+    MemberValueDescription(
+        key="firmware",
+        name="Firmware",
+        value_fn=lambda member: member.firmware,
+    ),
+    MemberValueDescription(
+        key="wifi_ssid",
+        name="Wi-Fi SSID",
+        value_fn=lambda member: member.wifi_ssid,
+    ),
+)
+
+
+class MilesightFleetMemberSensor(
+    CoordinatorEntity[MilesightDiagnosticsCoordinator], SensorEntity
+):
+    """One value of a fleet member, read from its own web interface."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    entity_description: MemberValueDescription
+
+    def __init__(
+        self,
+        coordinator: MilesightDiagnosticsCoordinator,
+        gateway: FleetGateway,
+        entry_id: str,
+        gateway_id: str,
+        description: MemberValueDescription,
+    ) -> None:
+        """Attach the value to the member's device."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._eui = gateway.eui
+        self._attr_unique_id = f"{entry_id}_{gateway.eui}_{description.key}"
+        self._attr_device_info = fleet_device_info(
+            gateway, entry_id, gateway_id, local=False
+        )
+
+    @property
+    def _member(self) -> MemberStatus | None:
+        data = self.coordinator.data
+        return data.members.get(self._eui) if data else None
+
+    @property
+    def available(self) -> bool:
+        """Unavailable while the member does not answer."""
+        return super().available and self._member is not None
+
+    @property
+    def native_value(self) -> StateType:
+        """Return the value the member reported last."""
+        member = self._member
+        return self.entity_description.value_fn(member) if member else None

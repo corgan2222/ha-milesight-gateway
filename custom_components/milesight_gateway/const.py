@@ -23,6 +23,11 @@ DEFAULT_GATEWAY_MQTT_BASE_TOPIC = "sensors/lora/uplink"
 DEFAULT_SCAN_INTERVAL = 300  # 5 minutes — device list rarely changes
 FIRMWARE_SCAN_INTERVAL = timedelta(hours=12)
 FIRMWARE_RETRY_INTERVAL = timedelta(minutes=5)
+# A gateway installs an image and comes back within some minutes.
+UPGRADE_POLL_SECONDS = 15
+UPGRADE_TIMEOUT_SECONDS = 1500
+# Under the configuration folder: the backup taken before each upgrade.
+BACKUP_FOLDER = "milesight_gateway_backups"
 MIN_SCAN_INTERVAL = 60
 
 # Options. Absent from older entries, so every reader falls back to a default
@@ -42,9 +47,28 @@ CONF_ALL_SETTINGS = "all_settings"
 # LoRaWAN source: the network map in the sidebar. Off hides only the menu
 # entry; the page keeps its address and the dashboard card works.
 CONF_NETWORK_PANEL = "network_panel"
+# The device page in the sidebar. Off hides only the menu entry; the page
+# keeps its address.
+CONF_DEVICES_PANEL = "devices_panel"
+# Minutes without an uplink after which a device counts as offline, where
+# the gateway names no timeout of its own; the network server's default.
+DEVICE_TIMEOUT = 1440
 # Gateway-only entries: the MQTT topic the gateway publishes its devices'
 # uplinks under, with {dev_eui} where the devEUI sits. Absent: no devices.
 CONF_MQTT_TOPIC = "mqtt_topic"
+# Gateway-only entries: the topics the gateway's application takes downlinks
+# from and reports their ACKs to, with {dev_eui} like the uplink topic. Without
+# a downlink topic the devices get no settings; without an ACK topic nothing
+# is sent again.
+CONF_MQTT_DOWNLINK_TOPIC = "mqtt_downlink_topic"
+CONF_MQTT_ACK_TOPIC = "mqtt_ack_topic"
+# Gateway-only entries: where the gateway reports errors and joins, and where
+# its network server takes API requests and answers them (word for word, they
+# name no device).
+CONF_MQTT_ERROR_TOPIC = "mqtt_error_topic"
+CONF_MQTT_JOIN_TOPIC = "mqtt_join_topic"
+CONF_MQTT_REQUEST_TOPIC = "mqtt_request_topic"
+CONF_MQTT_RESPONSE_TOPIC = "mqtt_response_topic"
 
 # Entry data, set by the config flow: the gateway refuses the network server
 # login but takes the account on its web interface (UG63 Mini). Such an entry

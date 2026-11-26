@@ -130,7 +130,14 @@
           "data_source": "Datenquelle",
           "all_settings": "Alle Geräteeinstellungen als Entities",
           "mqtt_topic": "MQTT-Topic der Geräte",
-          "network_panel": "Netzwerkkarte in der Seitenleiste zeigen"
+          "network_panel": "Netzwerkkarte in der Seitenleiste zeigen",
+          "devices_panel": "Geräteseite in der Seitenleiste zeigen",
+          "mqtt_downlink_topic": "MQTT-Downlink-Topic",
+          "mqtt_ack_topic": "MQTT-ACK-Topic",
+          "mqtt_error_topic": "MQTT-Error-Topic",
+          "mqtt_join_topic": "MQTT-Join-Topic",
+          "mqtt_request_topic": "MQTT-Request-Topic",
+          "mqtt_response_topic": "MQTT-Response-Topic"
         },
         "data_description": {
           "scan_interval": "Wie oft das Gateway gelesen wird: seine Geräteliste, bei einem Gateway ohne Geräteliste nur, ob es antwortet.",
@@ -139,9 +146,16 @@
           "firmware_check": "Sucht zweimal am Tag auf milesight.com nach der neuesten Gateway-Firmware.",
           "devices": "Nur diese Geräte bekommen Entities. Leer lassen für alle Geräte. Was Sie aus der Liste nehmen, verschwindet mit seinen Entities aus Home Assistant.",
           "data_source": "Woher die Sensorwerte der Geräte kommen.",
-          "all_settings": "Nur bei LoRaWAN. Jedes Gerät bekommt immer Berichtsintervall, Solltemperatur (Thermostate), Neustart und Statusabfrage. Eingeschaltet bekommt jedes Gerät zusätzlich eine Entity für jede weitere Einstellung, die sein Codec kennt, rund 25: Alarme, Schwellwerte, Kalibrierung. Sie sind zunächst abgeschaltet; aktivieren Sie die, die Sie brauchen.",
+          "all_settings": "Jedes Gerät bekommt immer Berichtsintervall, Solltemperatur (Thermostate), Neustart und Statusabfrage. Eingeschaltet bekommt jedes Gerät zusätzlich eine Entity für jede weitere Einstellung, die sein Codec kennt, rund 25: Alarme, Schwellwerte, Kalibrierung. Sie sind zunächst abgeschaltet; aktivieren Sie die, die Sie brauchen.",
           "mqtt_topic": "Zum Beispiel sensors/lora/uplink/{dev_eui}. {dev_eui} markiert die Stelle der DevEUI; jeder andere Platzhalter in geschweiften Klammern oder + passt auf alles. Leer lassen, um nur das Gateway zu zeigen.",
-          "network_panel": "Nur bei LoRaWAN. Ein Menüeintrag gilt für alle Gateways; ist er bei einem davon ausgeschaltet, verschwindet er aus der Seitenleiste. Die Seite bleibt unter ihrer Adresse erreichbar, und die Dashboard-Karte funktioniert weiter."
+          "network_panel": "Nur bei LoRaWAN. Ein Menüeintrag gilt für alle Gateways; ist er bei einem davon ausgeschaltet, verschwindet er aus der Seitenleiste. Die Seite bleibt unter ihrer Adresse erreichbar, und die Dashboard-Karte funktioniert weiter.",
+          "devices_panel": "Ein Menüeintrag gilt für alle Gateways; ist er bei einem davon ausgeschaltet, verschwindet er aus der Seitenleiste. Die Seite bleibt unter ihrer Adresse /milesight-devices erreichbar.",
+          "mqtt_downlink_topic": "Das Topic, von dem die Anwendung des Gateways Downlinks nimmt, zum Beispiel sensors/lora/downlink/{dev_eui}. Leer lassen für keine Geräteeinstellungen.",
+          "mqtt_ack_topic": "Das Topic, auf das die Anwendung die ACKs bestätigter Downlinks meldet, zum Beispiel sensors/lora/ack/{dev_eui}. Damit wird ein Downlink ohne ACK erneut gesendet.",
+          "mqtt_error_topic": "Wohin die Anwendung gescheiterte Downlinks meldet, zum Beispiel sensors/lora/error/{dev_eui}.",
+          "mqtt_join_topic": "Wohin die Anwendung Joins meldet, zum Beispiel sensors/lora/join/{dev_eui}.",
+          "mqtt_request_topic": "Wo der Network Server API-Anfragen nimmt, genau wie auf dem Gateway eingetragen, samt $deveui. Mit dem Response-Topic kommt die Geräteliste vom Gateway.",
+          "mqtt_response_topic": "Wo der Network Server API-Anfragen beantwortet, genau wie auf dem Gateway eingetragen."
         }
       },
       "confirm_source": {
@@ -150,7 +164,8 @@
       }
     },
     "error": {
-      "invalid_topic": "Das Topic braucht ganze Ebenen: {dev_eui} höchstens einmal, + oder ein anderer Platzhalter nur als ganze Ebene, kein #."
+      "invalid_topic": "Das Topic braucht ganze Ebenen: {dev_eui} höchstens einmal, + oder ein anderer Platzhalter nur als ganze Ebene, kein #.",
+      "invalid_downlink_topic": "Ein Downlink- oder ACK-Topic nennt ein Gerät: {dev_eui} genau einmal, kein + oder #, kein anderer Platzhalter."
     }
   },
   "entity": {
@@ -168,19 +183,58 @@
           "node": "Knoten (Packet Forwarder)",
           "standalone": "Eigenständig"
         }
+      },
+      "command_status": {
+        "name": "Befehlsstatus",
+        "state": {
+          "pending": "Ausstehend",
+          "retrying": "Wird wiederholt",
+          "transmitted": "Zugestellt, wartet auf ACK",
+          "acknowledged": "Bestätigt (ACK)",
+          "confirmed": "Vom Gerät bestätigt",
+          "differs": "Gerät meldet abweichend",
+          "sent": "Gesendet",
+          "failed": "Fehlgeschlagen"
+        }
+      },
+      "signal_quality": {
+        "name": "Signalqualität",
+        "state": {
+          "excellent": "Sehr gut",
+          "good": "Gut",
+          "fair": "Mäßig",
+          "poor": "Schlecht"
+        }
+      },
+      "packet_loss": {
+        "name": "Paketverlust heute"
+      },
+      "gateways_in_range": {
+        "name": "Gateways in Reichweite"
+      },
+      "battery_days_left": {
+        "name": "Batterie-Restlaufzeit"
+      }
+    },
+    "button": {
+      "sync_devices": {
+        "name": "Geräte abgleichen"
       }
     }
   },
   "exceptions": {
     "downlink_failed": {
       "message": "Das Gateway hat den Befehl für das Gerät nicht angenommen: {error}"
+    },
+    "sync_failed": {
+      "message": "Die Geräteliste des Gateways ist nicht lesbar: {error}"
     }
   },
   "selector": {
     "data_source": {
       "options": {
         "lorawan": "LoRaWAN: liest das Paketlog des Gateways und dekodiert mit Milesights eigenen Codecs. Braucht keinen MQTT-Broker. Einstellungen gehen über den Network Server des Gateways an die Geräte, für jedes Modell, für das Milesight einen Codec veröffentlicht.",
-        "mqtt": "MQTT: übernimmt, was das Gateway veröffentlicht, dekodiert mit den Payload-Codecs auf dem Gateway. Braucht einen MQTT-Broker in Home Assistant. Einstellungen gehen über den Network Server des Gateways an die Geräte, für die Modelle, die diese Integration selbst beschreibt."
+        "mqtt": "MQTT: übernimmt, was das Gateway veröffentlicht, dekodiert mit den Payload-Codecs auf dem Gateway. Braucht einen MQTT-Broker in Home Assistant. Einstellungen gehen über das MQTT-Downlink-Topic der Gateway-Anwendung an die Geräte, ihr ACK kommt über deren ACK-Topic zurück."
       }
     }
   }

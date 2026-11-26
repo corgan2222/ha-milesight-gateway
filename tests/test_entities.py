@@ -1,46 +1,43 @@
-"""Tests for how payload keys become entities and how binary values are read."""
+"""Tests for how catalog values read when a payload codec already named them."""
 
 from __future__ import annotations
 
 import pytest
 
-from custom_components.milesight_gateway.api import _build_device
-from custom_components.milesight_gateway.binary_sensor import is_on
+from custom_components.milesight_gateway.lorawan_entity import is_set, value_name
+
+DOOR = {"type": "BOOL", "values": {"0": "close", "1": "open"}}
+MODE = {"type": "ENUM", "values": {"0": "auto", "1": "manual"}}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        (DOOR, 0, False),
+        (DOOR, 1, True),
+        (DOOR, "1", True),
+        (DOOR, "open", True),
+        (DOOR, "Close", False),
+        (DOOR, None, None),
+        ({}, 2, True),
+        ({}, "2.5", True),
+        ({}, True, True),
+        ({}, False, False),
+        ({}, "OCCUPIED", True),
+        ({}, "off", False),
+        ({}, "", False),
+        ({}, "garbage", False),
+    ],
+)
+def test_is_set(field, value, expected):
+    """Numbers count unless 0; names and the usual words count as they say."""
+    assert is_set(field, value) is expected
 
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [
-        (0, False),
-        (1, True),
-        (2, True),
-        ("0", False),
-        ("2", True),
-        ("2.5", True),
-        (True, True),
-        (False, False),
-        ("on", True),
-        ("OCCUPIED", True),
-        ("off", False),
-        ("", False),
-        ("garbage", False),
-        ([], False),
-    ],
+    [(0, "auto"), ("1", "manual"), ("manual", "manual"), ("other", None), (None, None)],
 )
-def test_is_on(value, expected):
-    """Counts above zero are on, words are matched, anything else is off."""
-    assert is_on(value) is expected
-
-
-def test_people_count_gives_occupancy_and_a_count():
-    """One payload key can map to a binary sensor and a sensor."""
-    device = _build_device(
-        {"devEUI": "24E124123456789A", "name": "vs321"},
-        {"id": "vs321", "name": "VS321", "device_entities": ["people_total_counts"]},
-        "milesight",
-    )
-
-    assert [(e.key, e.platform, e.name) for e in device.entities] == [
-        ("people_total_counts", "binary_sensor", "Occupancy"),
-        ("people_total_counts", "sensor", "People count"),
-    ]
+def test_value_name(value, expected):
+    """A raw value gets its name; a name the codec sent stays."""
+    assert value_name(MODE, value) == expected

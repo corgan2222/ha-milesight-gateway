@@ -62,6 +62,10 @@ def _client(data: dict[str, Any]) -> MilesightGatewayClient:
 class LoRaWANRuntime:
     """One gateway entry's connection, device models and coordinators."""
 
+    sends_downlinks = True
+    # How values come and settings go, for the device page.
+    path = "rest"
+
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Prepare; async_start() connects."""
         self.hass = hass

@@ -75,14 +75,7 @@ async def async_get_config_entry_diagnostics(
                 "online": devices.online_count,
                 "offline": devices.offline_count,
                 "matched": [
-                    {
-                        "model_id": device.model_id,
-                        "model": device.model,
-                        "entities": sorted(
-                            f"{entity.platform}.{entity.key}"
-                            for entity in device.entities
-                        ),
-                    }
+                    {"model_id": device.model_id, "model": device.model}
                     for device in devices.devices
                 ],
             }
