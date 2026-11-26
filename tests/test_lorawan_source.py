@@ -95,7 +95,8 @@ class FakeConnection:
             self.uplink(self.early_uplink)
         return lambda: self._listeners.remove(listener)
 
-    def on_disconnect(self, _listener):
+    def on_disconnect(self, listener):
+        self.disconnected = listener
         return lambda: None
 
     async def async_send_downlink(self, downlink) -> str:
@@ -539,3 +540,21 @@ async def test_last_seen_comes_from_the_network_server_until_an_uplink(
     await hass.async_block_till_done()
 
     assert hass.states.get(entity_id).state == "2026-11-24T12:00:00+00:00"
+
+
+async def test_a_lost_gateway_waits_while_it_installs_firmware(
+    hass, mqtt_entry, connection
+):
+    """It reboots into the new firmware; a reload would end the wait for it."""
+    fake = await _switch_to_lorawan(hass, mqtt_entry)
+    runtime = mqtt_entry.runtime_data
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        runtime.installing = True
+        fake.disconnected()
+        reload.assert_not_called()
+        assert runtime.reload_after_install
+
+        runtime.installing = runtime.reload_after_install = False
+        fake.disconnected()
+        reload.assert_called_once_with(mqtt_entry.entry_id)

@@ -1198,3 +1198,41 @@ async def test_a_failed_upload_says_so(hass, mqtt, get_devices, firmware):
         await hass.services.async_call(
             "update", "install", {"entity_id": FIRMWARE}, blocking=True
         )
+
+
+async def test_a_reload_held_back_during_the_installation_follows_it(
+    hass, mqtt, get_devices, firmware
+):
+    """The data source lost the rebooting gateway; the entry reloads afterwards."""
+    entry = await _setup_on(hass, firmware, "60.0.0.45")
+
+    async def upload(_self, _session, _image):
+        assert entry.runtime_data.installing
+        entry.runtime_data.reload_after_install = True
+        firmware[0].return_value = GatewayInfo(model="UG65", firmware="60.0.0.51")
+
+    with (
+        patch.object(
+            MilesightGatewayAPI, "async_download_backup", AsyncMock(return_value=b"x")
+        ),
+        patch.object(MilesightGatewayAPI, "async_upgrade_firmware", upload),
+        patch(
+            "custom_components.milesight_gateway.coordinator.save_backup",
+            MagicMock(return_value="/config/x.backup"),
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.async_download_firmware",
+            AsyncMock(return_value=b"image"),
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.asyncio.sleep", AsyncMock()
+        ),
+        patch.object(hass.config_entries, "async_schedule_reload") as reload,
+    ):
+        await hass.services.async_call(
+            "update", "install", {"entity_id": FIRMWARE}, blocking=True
+        )
+
+    reload.assert_called_once_with(entry.entry_id)
+    assert not entry.runtime_data.installing
+    assert not entry.runtime_data.reload_after_install

@@ -133,8 +133,15 @@ class LoRaWANRuntime:
 
     @callback
     def _disconnected(self) -> None:
-        if not self.hass.is_stopping:
-            self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
+        if self.hass.is_stopping:
+            return
+        runtime = self.entry.runtime_data
+        if runtime.installing:
+            # A reload now would end the installation's wait for the new
+            # version; it follows once the installation is over.
+            runtime.reload_after_install = True
+            return
+        self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
     @callback
     def _added(self, device: MilesightDevice) -> None:

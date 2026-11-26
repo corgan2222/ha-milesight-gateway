@@ -99,6 +99,10 @@ class RuntimeData:
     settings: SettingsLog | None = None
     # What happened to the downlinks, for the device page.
     journal: Journal | None = None
+    # While the gateway installs firmware it reboots; a lost connection is
+    # then expected and the entry is reloaded only once it is done.
+    installing: bool = False
+    reload_after_install: bool = False
 
     @property
     def devices(self) -> LoRaWANRuntime | MqttDiscoveryRuntime | None:

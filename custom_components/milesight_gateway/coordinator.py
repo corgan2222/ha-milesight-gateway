@@ -368,18 +368,23 @@ class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
         if step is None or self.installing:
             msg = "There is no firmware to install, or an installation is running"
             raise HomeAssistantError(msg)
-        self.installing = True
+        entry = self.config_entry
+        self.installing = entry.runtime_data.installing = True
         try:
             await async_install_firmware(
                 self.hass,
                 self.api,
-                address=self.config_entry.data[CONF_GATEWAY_URL],
+                address=entry.data[CONF_GATEWAY_URL],
                 installed=self.data.installed,
                 step=step,
                 progress=progress,
             )
         finally:
-            self.installing = False
+            self.installing = entry.runtime_data.installing = False
+            if entry.runtime_data.reload_after_install:
+                # The data source lost the gateway while it rebooted.
+                entry.runtime_data.reload_after_install = False
+                self.hass.config_entries.async_schedule_reload(entry.entry_id)
         await self.async_refresh()
 
     async def _async_get_details(self, session: ClientSession) -> GatewayDetails | None:
