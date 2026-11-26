@@ -18,7 +18,14 @@ if TYPE_CHECKING:
 
 # Device entities of both sources that are not catalog fields: the gateway's
 # radio values of a device's newest uplink, the last-seen time, the thermostat.
-_KEPT = {"spreading_factor", "frequency", "last_seen", "thermostat"}
+_KEPT = {
+    "spreading_factor",
+    "frequency",
+    "rssi",
+    "loRaSNR",
+    "last_seen",
+    "thermostat",
+}
 
 
 def _platform(key: str, field: dict[str, Any]) -> str:

@@ -22,6 +22,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -33,8 +34,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from homeassistant.config_entries import ConfigEntry
+    from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
-    from .api import MilesightDevice
+    from .api import GatewayDetails, GatewayInfo, MilesightDevice
 
 from .api import APIAuthError, APIConnectionError, MilesightGatewayAPI
 from .const import (
@@ -43,8 +45,14 @@ from .const import (
     CONF_DEVICES,
     CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
+    CONF_GATEWAY_ONLY,
     CONF_GATEWAY_URL,
+    CONF_HOSTNAME,
     CONF_IV,
+    CONF_MAC,
+    CONF_MODEL,
+    CONF_MQTT_TOPIC,
+    CONF_NETWORK_PANEL,
     CONF_SECRET_KEY,
     CONF_STATUS_INTERVAL,
     CONF_WEB_DATA,
@@ -57,15 +65,22 @@ from .const import (
     MIN_SCAN_INTERVAL,
     SOURCE_LORAWAN,
     SOURCE_MQTT,
+    WEB_ONLY_FIRMWARE,
     data_source,
+    entry_title,
+    gateway_only,
 )
 from .coordinator import status_interval
+from .hostname import short_hostname, tracker_hostname
+from .mqtt_discovery import topic_error
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_USER_DATA_SCHEMA = vol.Schema({vol.Required(CONF_GATEWAY_URL): str})
+
+
+STEP_CREDENTIALS_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_GATEWAY_URL): str,
         vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
@@ -101,6 +116,41 @@ STEP_REAUTH_DATA_SCHEMA = vol.Schema(
 )
 
 
+# A gateway without a usable network server only needs its web login. The
+# other fields keep their defaults: the web login uses the same AES constants.
+STEP_WEB_LOGIN_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_USERNAME): str,
+        vol.Required(CONF_PASSWORD): str,
+    }
+)
+
+# The texts about the topic write the placeholder literally; braces in a
+# translation are placeholders themselves, so it comes in as a value.
+TOPIC_PLACEHOLDER = {"dev_eui": "{dev_eui}"}
+
+# At setup the web login also takes the MQTT topic the gateway's applications
+# publish to, so its devices are found there.
+STEP_WEB_SETUP_DATA_SCHEMA = STEP_WEB_LOGIN_DATA_SCHEMA.extend(
+    {vol.Optional(CONF_MQTT_TOPIC): str}
+)
+
+STEP_WEB_RECONFIGURE_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_GATEWAY_URL): str,
+        vol.Required(CONF_USERNAME): str,
+        vol.Optional(CONF_PASSWORD): str,
+    }
+)
+
+WEB_ONLY_DEFAULTS = {
+    CONF_PORT: DEFAULT_PORT,
+    CONF_SECRET_KEY: DEFAULT_SECRET_KEY,
+    CONF_IV: DEFAULT_IV,
+    CONF_GATEWAY_MQTT_BASE_TOPIC: DEFAULT_GATEWAY_MQTT_BASE_TOPIC,
+}
+
+
 def _clean_url(url: str) -> str:
     """Normalize a gateway URL so it is usable and comparable."""
     return url.strip().rstrip("/")
@@ -131,8 +181,37 @@ def _url_error(url: str) -> str | None:
 
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect."""
-    api = MilesightGatewayAPI(
+    """
+    Check the gateway takes the account, and whether its network server does.
+
+    A Milesight Mini gateway (UG63) takes the account on its web interface but
+    refuses the network server login that the device list and the LoRaWAN source
+    need. Such an entry runs gateway-only: the gateway itself, without its
+    devices. A login the web interface also refuses is simply wrong.
+    """
+    api = _api(data)
+    session = async_get_clientsession(hass)
+    try:
+        await api.async_connect(session)
+    except APIAuthError as err:
+        if details := await _web_details(api, session):
+            return {"api": api, "gateway_only": True, "hostname": details.hostname}
+        raise InvalidAuthError from err
+    except APIConnectionError as err:
+        raise CannotConnectError from err
+
+    details = await _web_details(api, session)
+    return {
+        "api": api,
+        "gateway_only": False,
+        "hostname": details.hostname if details else None,
+    }
+
+
+def _api(data: Mapping[str, Any]) -> MilesightGatewayAPI:
+    """Build the API client from entry data, with defaults for what is missing."""
+    data = {**WEB_ONLY_DEFAULTS, CONF_USERNAME: "", CONF_PASSWORD: "", **data}
+    return MilesightGatewayAPI(
         gateway_url=data[CONF_GATEWAY_URL],
         port=data[CONF_PORT],
         username=data[CONF_USERNAME],
@@ -141,15 +220,49 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         iv=data[CONF_IV],
         mqtt_base_topic=data[CONF_GATEWAY_MQTT_BASE_TOPIC],
     )
+
+
+async def probe_gateway(hass: HomeAssistant, url: str) -> GatewayInfo:
+    """
+    Return the gateway's model and firmware, asked without a login.
+
+    The form that follows depends on it, and no login is spent on a model whose
+    network server refuses it.
+    """
     try:
-        session = async_get_clientsession(hass)
-        await api.async_connect(session)
+        info = await _api({CONF_GATEWAY_URL: url}).async_get_gateway_info(
+            async_get_clientsession(hass)
+        )
+    except (APIAuthError, APIConnectionError) as err:
+        raise CannotConnectError from err
+    return info
+
+
+async def validate_web_login(
+    hass: HomeAssistant, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Check the gateway's web interface takes the account; never the NS login."""
+    api = _api(data)
+    try:
+        details = await api.async_get_gateway_details(async_get_clientsession(hass))
     except APIAuthError as err:
         raise InvalidAuthError from err
     except APIConnectionError as err:
         raise CannotConnectError from err
+    return {"api": api, "gateway_only": True, "hostname": details.hostname}
 
-    return {"title": data[CONF_GATEWAY_URL], "api": api}
+
+def _validator(data: Mapping[str, Any]) -> Any:
+    """Return the check that fits an existing entry, sparing a gateway-only one."""
+    return validate_web_login if gateway_only(data) else validate_input
+
+
+async def _web_details(api: MilesightGatewayAPI, session: Any) -> GatewayDetails | None:
+    """Return what the web interface reports, or None when it refuses the account."""
+    try:
+        return await api.async_get_gateway_details(session)
+    except APIAuthError, APIConnectionError:
+        return None
 
 
 def device_choices(devices: list[MilesightDevice]) -> list[SelectOptionDict]:
@@ -161,6 +274,9 @@ def device_choices(devices: list[MilesightDevice]) -> list[SelectOptionDict]:
         )
         for device in devices
     ]
+
+
+SOURCE_NAMES = {SOURCE_LORAWAN: "LoRaWAN", SOURCE_MQTT: "MQTT"}
 
 
 def source_selector() -> SelectSelector:
@@ -196,6 +312,19 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
         """Hold the first step's input until the devices are chosen."""
         self._data: dict[str, Any] = {}
         self._choices: list[SelectOptionDict] = []
+        # What /islogin named; it decides which login the next step asks for.
+        self._model: str | None = None
+        # Whether the firmware's network server refuses the login (UG63 on 63.x).
+        self._web_only = False
+        # Set by DHCP discovery; the entry's unique id when known.
+        self._mac: str | None = None
+        # The name the gateway sent with its DHCP request.
+        self._hostname: str | None = None
+
+    def _probe(self, info: GatewayInfo) -> None:
+        """Keep what /islogin reported for the steps that follow."""
+        self._model = info.model
+        self._web_only = info.firmware.split(".")[0] in WEB_ONLY_FIRMWARE
 
     @staticmethod
     @callback
@@ -205,20 +334,131 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
         """Return the options flow handler."""
         return MilesightGatewayOptionsFlow()
 
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
+        """Offer a discovered gateway, or move a known one to its new address."""
+        mac = format_mac(discovery_info.macaddress)
+        await self.async_set_unique_id(mac)
+        # Matched by MAC, or by address for an entry added by hand before its
+        # MAC was known; such an entry takes the MAC as its unique id now.
+        for entry in self._async_current_entries(include_ignore=False):
+            url = urlsplit(entry.data.get(CONF_GATEWAY_URL, ""))
+            if entry.unique_id == mac or url.hostname == discovery_info.ip:
+                updates = {
+                    CONF_GATEWAY_URL: f"{url.scheme or 'http'}://{discovery_info.ip}",
+                    CONF_MAC: mac,
+                }
+                # A hostname the gateway reports itself stays.
+                title = entry.title
+                if not entry.data.get(CONF_HOSTNAME) and (
+                    name := short_hostname(discovery_info.hostname)
+                ):
+                    updates[CONF_HOSTNAME] = name
+                    # The title follows, unless the user chose one.
+                    if title in (entry_title(entry.data), url.geturl()):
+                        title = entry_title({**entry.data, **updates})
+                return self.async_update_reload_and_abort(
+                    entry,
+                    unique_id=mac,
+                    title=title,
+                    data_updates=updates,
+                    reason="already_configured",
+                    reload_even_if_entry_is_unchanged=False,
+                )
+        # An ignored discovery stays ignored.
+        self._abort_if_unique_id_configured()
+
+        url = f"http://{discovery_info.ip}"
+        try:
+            self._probe(await probe_gateway(self.hass, url))
+        except CannotConnectError:
+            return self.async_abort(reason="cannot_connect")
+        self._data = {CONF_GATEWAY_URL: url}
+        self._mac = mac
+        self._hostname = short_hostname(discovery_info.hostname)
+        self.context["title_placeholders"] = {
+            "model": self._model or "Gateway",
+            "host": discovery_info.ip,
+        }
+        return await self.async_step_discovery_confirm()
+
+    async def async_step_discovery_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask whether to set up the discovered gateway."""
+        if user_input is not None:
+            return await self.async_step_credentials()
+        self._set_confirm_only()
+        return self.async_show_form(
+            step_id="discovery_confirm",
+            description_placeholders=self.context["title_placeholders"],
+        )
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial setup step."""
+        """Ask for the address and find out which gateway answers there."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            user_input[CONF_GATEWAY_URL] = _clean_url(user_input[CONF_GATEWAY_URL])
-            info: dict[str, Any] = {}
-            if url_error := _url_error(user_input[CONF_GATEWAY_URL]):
+            url = _clean_url(user_input[CONF_GATEWAY_URL])
+            if url_error := _url_error(url):
                 errors[CONF_GATEWAY_URL] = url_error
             else:
+                # By host, so http and https of one gateway are one gateway.
+                host = urlsplit(url).hostname
+                for entry in self._async_current_entries():
+                    known = urlsplit(entry.data.get(CONF_GATEWAY_URL, "")).hostname
+                    if known == host:
+                        return self.async_abort(reason="already_configured")
                 try:
-                    info = await validate_input(self.hass, user_input)
+                    self._probe(await probe_gateway(self.hass, url))
+                except CannotConnectError:
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    _LOGGER.exception("Unexpected exception")
+                    errors["base"] = "unknown"
+            if not errors:
+                self._data = {CONF_GATEWAY_URL: url}
+                return await self.async_step_credentials()
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_USER_DATA_SCHEMA, user_input or {}
+            ),
+            errors=errors,
+        )
+
+    async def async_step_credentials(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for the login the detected model needs, and check it."""
+        errors: dict[str, str] = {}
+        # A model without a usable network server gets the web login only, and
+        # no network server login is tried: failed logins lock the account.
+        web_only = self._web_only
+        schema = (
+            STEP_WEB_SETUP_DATA_SCHEMA if web_only else STEP_CREDENTIALS_DATA_SCHEMA
+        )
+
+        if user_input is not None:
+            # An option, not entry data: the options can change it later.
+            topic = (user_input.get(CONF_MQTT_TOPIC) or "").strip()
+            data = {
+                **(WEB_ONLY_DEFAULTS if web_only else {}),
+                **{k: v for k, v in user_input.items() if k != CONF_MQTT_TOPIC},
+                **self._data,
+            }
+            info: dict[str, Any] = {}
+            # A wrong topic costs no login: failed logins lock the account.
+            if topic and (error := topic_error(topic)):
+                errors[CONF_MQTT_TOPIC] = error
+            else:
+                try:
+                    validate = validate_web_login if web_only else validate_input
+                    info = await validate(self.hass, data)
                 except CannotConnectError:
                     errors["base"] = "cannot_connect"
                 except InvalidAuthError:
@@ -227,16 +467,51 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                     _LOGGER.exception("Unexpected exception")
                     errors["base"] = "unknown"
             if not errors:
-                unique_id = f"{user_input[CONF_GATEWAY_URL]}:{user_input[CONF_PORT]}"
-                await self.async_set_unique_id(unique_id)
+                url = data[CONF_GATEWAY_URL]
+                await self.async_set_unique_id(self._mac or f"{url}:{data[CONF_PORT]}")
                 self._abort_if_unique_id_configured()
-                self._data = user_input
+                if self._mac:
+                    data[CONF_MAC] = self._mac
+                if self._model:
+                    data[CONF_MODEL] = self._model
+                # The gateway's own name first, then its DHCP name.
+                if hostname := (
+                    info.get("hostname")
+                    or self._hostname
+                    or tracker_hostname(self.hass, self._mac, urlsplit(url).hostname)
+                ):
+                    data[CONF_HOSTNAME] = hostname
+                self._data = data
+                if info["gateway_only"]:
+                    # No device list, so nothing to pick and no data source to
+                    # choose: the entry covers the gateway itself. The flag is
+                    # only set when true, so other entries keep their data as is.
+                    self._data[CONF_GATEWAY_ONLY] = True
+                    return self.async_create_entry(
+                        title=entry_title(self._data),
+                        data=self._data,
+                        options={CONF_MQTT_TOPIC: topic} if topic else {},
+                    )
                 self._choices = await self._async_list_devices(info["api"])
                 return await self.async_step_devices()
 
+        suggested = {k: v for k, v in (user_input or {}).items() if k != CONF_PASSWORD}
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+            # Its own step so the form can say that devices are not shown.
+            step_id="web_login" if web_only else "credentials",
+            data_schema=self.add_suggested_values_to_schema(schema, suggested),
+            errors=errors,
+            description_placeholders={
+                "model": self._model or "Milesight",
+                **(TOPIC_PLACEHOLDER if web_only else {}),
+            },
         )
+
+    async def async_step_web_login(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Take the web login of a model without a usable network server."""
+        return await self.async_step_credentials(user_input)
 
     async def async_step_devices(
         self, user_input: dict[str, Any] | None = None
@@ -249,7 +524,7 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         if user_input is not None:
             return self.async_create_entry(
-                title=self._data[CONF_GATEWAY_URL],
+                title=entry_title(self._data),
                 data=self._data,
                 options={
                     CONF_DATA_SOURCE: user_input.get(CONF_DATA_SOURCE, SOURCE_LORAWAN),
@@ -303,7 +578,7 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                await validate_input(self.hass, {**entry.data, **user_input})
+                await _validator(entry.data)(self.hass, {**entry.data, **user_input})
             except CannotConnectError:
                 errors["base"] = "cannot_connect"
             except InvalidAuthError:
@@ -326,7 +601,10 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reauth_confirm",
             data_schema=self.add_suggested_values_to_schema(
-                STEP_REAUTH_DATA_SCHEMA, suggested
+                STEP_WEB_LOGIN_DATA_SCHEMA
+                if gateway_only(entry.data)
+                else STEP_REAUTH_DATA_SCHEMA,
+                suggested,
             ),
             errors=errors,
         )
@@ -352,7 +630,7 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_GATEWAY_URL] = url_error
             else:
                 try:
-                    await validate_input(self.hass, merged)
+                    info = await _validator(entry.data)(self.hass, merged)
                 except CannotConnectError:
                     errors["base"] = "cannot_connect"
                 except InvalidAuthError:
@@ -360,6 +638,9 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                 except Exception:
                     _LOGGER.exception("Unexpected exception")
                     errors["base"] = "unknown"
+                else:
+                    # The new address may be another model; keep the mode in step.
+                    updates[CONF_GATEWAY_ONLY] = info["gateway_only"]
             if not errors:
                 # Skips the entry being reconfigured, so moving this gateway to
                 # a new address is allowed while colliding with another is not.
@@ -369,11 +650,12 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_PORT: merged[CONF_PORT],
                     }
                 )
-                # The unique id is derived from the address, so it has to move
-                # with it or the new address could be added a second time.
+                # Without a MAC the unique id is derived from the address, so it
+                # has to move with it or the new address could be added twice.
                 return self.async_update_reload_and_abort(
                     entry,
-                    unique_id=f"{merged[CONF_GATEWAY_URL]}:{merged[CONF_PORT]}",
+                    unique_id=entry.data.get(CONF_MAC)
+                    or f"{merged[CONF_GATEWAY_URL]}:{merged[CONF_PORT]}",
                     data_updates=updates,
                 )
 
@@ -388,7 +670,10 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(
-                STEP_RECONFIGURE_DATA_SCHEMA, suggested
+                STEP_WEB_RECONFIGURE_DATA_SCHEMA
+                if gateway_only(entry.data)
+                else STEP_RECONFIGURE_DATA_SCHEMA,
+                suggested,
             ),
             errors=errors,
         )
@@ -397,17 +682,35 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
 class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
     """Handle options for the Milesight Gateway integration."""
 
+    def __init__(self) -> None:
+        """Hold the options while a change of data source waits for its yes."""
+        self._pending: dict[str, Any] = {}
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
-        choices = self._device_choices()
+        only_gateway = gateway_only(self.config_entry.data)
+        # A gateway-only entry has no device list and no network server: no
+        # device choice, no data source, no device settings to send.
+        choices = None if only_gateway else self._device_choices()
+        errors: dict[str, str] = {}
         if user_input is not None:
             if choices is not None:
                 # An emptied selection may arrive as a missing key; without
                 # this the merge below would keep the old selection.
                 user_input.setdefault(CONF_DEVICES, [])
-            return self.async_create_entry(data=self.config_entry.options | user_input)
+            if only_gateway:
+                # Emptied, the field is missing: no devices on MQTT any more.
+                topic = (user_input.get(CONF_MQTT_TOPIC) or "").strip()
+                user_input[CONF_MQTT_TOPIC] = topic
+                if topic and (error := topic_error(topic)):
+                    errors[CONF_MQTT_TOPIC] = error
+            if not errors:
+                self._pending = self.config_entry.options | user_input
+                if data_source(self._pending) != data_source(self.config_entry.options):
+                    return await self.async_step_confirm_source()
+                return self.async_create_entry(data=self._pending)
 
         options = self.config_entry.options
         schema: dict[Any, Any] = {
@@ -423,13 +726,21 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
                 CONF_FIRMWARE_CHECK,
                 default=options.get(CONF_FIRMWARE_CHECK, True),
             ): bool,
-            vol.Required(
-                CONF_DATA_SOURCE, default=data_source(options)
-            ): source_selector(),
-            vol.Required(
-                CONF_ALL_SETTINGS, default=options.get(CONF_ALL_SETTINGS, False)
-            ): bool,
         }
+        if not only_gateway:
+            schema[vol.Required(CONF_DATA_SOURCE, default=data_source(options))] = (
+                source_selector()
+            )
+            schema[
+                vol.Required(
+                    CONF_ALL_SETTINGS, default=options.get(CONF_ALL_SETTINGS, False)
+                )
+            ] = bool
+            schema[
+                vol.Required(
+                    CONF_NETWORK_PANEL, default=options.get(CONF_NETWORK_PANEL, True)
+                )
+            ] = bool
         # The choice needs the gateway's device list, so it is only offered
         # while the entry is loaded; a stored selection stays as it is.
         if choices is not None:
@@ -443,7 +754,34 @@ class MilesightGatewayOptionsFlow(OptionsFlowWithReload):
                     },
                 )
             ] = device_selector(choices)
-        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))
+        if only_gateway:
+            schema[
+                vol.Optional(
+                    CONF_MQTT_TOPIC,
+                    description={"suggested_value": options.get(CONF_MQTT_TOPIC)},
+                )
+            ] = str
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(schema),
+            errors=errors,
+            description_placeholders=TOPIC_PLACEHOLDER,
+        )
+
+    async def async_step_confirm_source(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Say what a change of data source keeps and what it drops."""
+        if user_input is not None:
+            return self.async_create_entry(data=self._pending)
+        return self.async_show_form(
+            step_id="confirm_source",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "old": SOURCE_NAMES[data_source(self.config_entry.options)],
+                "new": SOURCE_NAMES[data_source(self._pending)],
+            },
+        )
 
     def _device_choices(self) -> list[SelectOptionDict] | None:
         """List the gateway's devices to pick from, or None when unknown."""

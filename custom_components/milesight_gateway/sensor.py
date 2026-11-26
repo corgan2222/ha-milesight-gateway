@@ -36,7 +36,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from . import lorawan_platforms
-from .const import CONF_GATEWAY_URL, DOMAIN, SOURCE_LORAWAN, data_source
+from .api import FLEET_MASTER, FLEET_NODE, FLEET_STANDALONE
+from .const import CONF_GATEWAY_URL, DOMAIN, gateway_only
 from .coordinator import (
     DiagnosticsData,
     MilesightDiagnosticsCoordinator,
@@ -100,17 +101,27 @@ async def async_setup_entry(
     gateway_host = urlparse(gateway_url).hostname or gateway_url
 
     gateway_device_info = DeviceInfo(identifiers={(DOMAIN, config_entry.entry_id)})
+    entry_id = config_entry.entry_id
+    # Without the network server login there is no device list to count.
+    only_gateway = gateway_only(config_entry.data)
 
     entities: list[SensorEntity] = [
-        MilesightOnlineDevicesSensor(coordinator, gateway_device_info),
-        MilesightOfflineDevicesSensor(coordinator, gateway_device_info),
         MilesightGatewayPingSensor(
             coordinator, gateway_device_info, gateway_host, port
         ),
     ]
+    if only_gateway:
+        for key in ("online_devices", "offline_devices"):
+            remove_switched_off_entity(hass, "sensor", f"{entry_id}_{key}")
+    else:
+        entities += [
+            MilesightOnlineDevicesSensor(coordinator, gateway_device_info),
+            MilesightOfflineDevicesSensor(coordinator, gateway_device_info),
+        ]
 
-    lorawan = data_source(config_entry.options) == SOURCE_LORAWAN
-    # The LoRaWAN source adds its device sensors below, as devices report.
+    # The LoRaWAN source, or MQTT for a gateway-only entry, adds its device
+    # sensors below, as devices report.
+    lorawan = config_entry.runtime_data.devices is not None
     for device in () if lorawan else coordinator.data.devices:
         entities.extend(
             MilesightSensor(coordinator, device, entity_def, gateway_url, gateway_id)
@@ -122,9 +133,10 @@ async def async_setup_entry(
         )
 
     diagnostics = config_entry.runtime_data.diagnostics
-    entry_id = config_entry.entry_id
     for description in GATEWAY_STATUS_SENSORS:
-        if diagnostics.web_data or not description.web:
+        # Web values need the web option; the others the network server login.
+        readable = description.web or not only_gateway
+        if readable and (diagnostics.web_data or not description.web):
             entities.append(
                 MilesightGatewayStatusSensor(diagnostics, description, entry_id)
             )
@@ -442,6 +454,17 @@ GATEWAY_STATUS_SENSORS: tuple[GatewayStatusDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=_system("storage_available"),
+        web=True,
+    ),
+    GatewayStatusDescription(
+        key="fleet_role",
+        name="Fleet role",
+        translation_key="fleet_role",
+        icon="mdi:lan",
+        device_class=SensorDeviceClass.ENUM,
+        options=[FLEET_MASTER, FLEET_NODE, FLEET_STANDALONE],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_system("fleet_role"),
         web=True,
     ),
     GatewayStatusDescription(

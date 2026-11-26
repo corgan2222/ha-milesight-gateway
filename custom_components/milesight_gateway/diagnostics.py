@@ -16,7 +16,13 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers import device_registry as dr
 
-from .const import CONF_GATEWAY_URL, CONF_IV, CONF_SECRET_KEY
+from .const import (
+    CONF_GATEWAY_URL,
+    CONF_HOSTNAME,
+    CONF_IV,
+    CONF_MAC,
+    CONF_SECRET_KEY,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -29,6 +35,9 @@ TO_REDACT = {
     CONF_SECRET_KEY,
     CONF_IV,
     CONF_GATEWAY_URL,
+    CONF_MAC,
+    # Names the customer site in fleet installations.
+    CONF_HOSTNAME,
     "configuration_url",
     "serial_number",
     "gateway_eui",

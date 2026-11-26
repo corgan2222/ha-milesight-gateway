@@ -387,6 +387,15 @@ class GatewayDetails:
     model_id: str | None
     serial_number: str | None
     hw_version: str | None
+    # From firmware 60.0.0.50 on; older firmware and the UG63 report none.
+    hostname: str | None = None
+
+
+# Role of a gateway in a Gateway Fleet, from the web interface's summary.
+FLEET_MASTER = "master"
+FLEET_NODE = "node"
+FLEET_STANDALONE = "standalone"
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 @dataclass(frozen=True)
@@ -397,6 +406,27 @@ class SystemStatus:
     memory_available: float | None
     storage_available: float | None
     uptime: int | None
+    fleet_role: str | None = None
+
+
+def fleet_role(system: dict[str, Any]) -> str | None:
+    """
+    Return whether the gateway leads a fleet, forwards to one, or stands alone.
+
+    A master counts fleet gateways. A node forwards its packets to a network
+    server elsewhere. Firmware without the packet forwarder block (UG63,
+    60.0.0.48 and older) tells neither, so the role stays unknown.
+    """
+    if (_int(system.get("gateway_fleet_total")) or 0) > 0:
+        return FLEET_MASTER
+    forwarder = system.get("packet_forwarder")
+    if not isinstance(forwarder, dict):
+        return None
+    for destination in _items(forwarder.get("destinations")):
+        address = str(destination.get("serv_addr") or "").strip().lower()
+        if destination.get("serv_enabled") is True and address not in _LOCAL_HOSTS:
+            return FLEET_NODE
+    return FLEET_STANDALONE
 
 
 @dataclass(frozen=True)
@@ -487,6 +517,17 @@ def _percent(value: Any) -> float | None:
         return float(value.strip().rstrip("%"))
     except ValueError:
         return None
+
+
+def _share(part: Any, total: Any) -> float | None:
+    """Return part of total in percent; numbers may arrive as text."""
+    try:
+        part, total = float(part), float(total)
+    except TypeError, ValueError:
+        return None
+    if total <= 0 or not 0 <= part <= total:
+        return None
+    return round(part / total * 100, 2)
 
 
 def _local_time(value: Any) -> datetime | None:
@@ -660,17 +701,23 @@ class MilesightGatewayAPI:
             model_id=_text(system.get("model")),
             serial_number=_text(system.get("sn")),
             hw_version=_text(system.get("hardware_ver")),
+            hostname=_text(system.get("hostname")),
         )
 
     async def async_get_system_status(self, session: ClientSession) -> SystemStatus:
         """Return CPU load, free memory and storage, and uptime."""
         system = await self._async_web_system(session)
         uptime = system.get("uptime")
+        memory = system.get("memory_avail_percent")
         return SystemStatus(
             cpu_load=_percent(system.get("cpu_load")),
-            memory_available=_percent(system.get("memory_avail_percent")),
+            # The UG63 reports no percentage, only free and total megabytes.
+            memory_available=_percent(memory)
+            if memory is not None
+            else _share(system.get("memory_free"), system.get("memory_total")),
             storage_available=_percent(system.get("emmc_avail_percent")),
             uptime=uptime if isinstance(uptime, int) and uptime >= 0 else None,
+            fleet_role=fleet_role(system),
         )
 
     async def _async_web_system(self, session: ClientSession) -> dict[str, Any]:

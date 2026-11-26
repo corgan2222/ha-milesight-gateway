@@ -19,9 +19,13 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import lorawan_platforms
-from .const import CONF_GATEWAY_URL, DOMAIN, SOURCE_LORAWAN, data_source
-from .coordinator import MilesightDiagnosticsCoordinator
-from .entity import MilesightDeviceEntity, fleet_device_info
+from .const import CONF_GATEWAY_URL, DOMAIN, gateway_only
+from .coordinator import MilesightDiagnosticsCoordinator, MilesightGatewayCoordinator
+from .entity import (
+    MilesightDeviceEntity,
+    fleet_device_info,
+    remove_switched_off_entity,
+)
 
 if TYPE_CHECKING:
     from homeassistant.components.mqtt.models import ReceiveMessage
@@ -29,7 +33,6 @@ if TYPE_CHECKING:
 
     from . import MilesightGatewayConfigEntry
     from .api import ApplicationLink, EntityDefinition, FleetGateway, MilesightDevice
-    from .coordinator import MilesightGatewayCoordinator
 
 PARALLEL_UPDATES = 0
 
@@ -53,7 +56,7 @@ def is_on(value: Any) -> bool:
 
 
 async def async_setup_entry(
-    _hass: HomeAssistant,
+    hass: HomeAssistant,
     config_entry: MilesightGatewayConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
@@ -63,8 +66,9 @@ async def async_setup_entry(
     # Keyed on the entry id, not the address, so the device survives an IP change.
     gateway_id = config_entry.runtime_data.gateway_device_id
 
-    lorawan = data_source(config_entry.options) == SOURCE_LORAWAN
-    # The LoRaWAN source adds its device binary sensors below, as devices report.
+    # The LoRaWAN source, or MQTT for a gateway-only entry, adds its device
+    # binary sensors below, as devices report.
+    lorawan = config_entry.runtime_data.devices is not None
     entities: list[BinarySensorEntity] = [
         MilesightBinarySensor(coordinator, device, entity_def, gateway_url, gateway_id)
         for device in (() if lorawan else coordinator.data.devices)
@@ -74,7 +78,14 @@ async def async_setup_entry(
 
     diagnostics = config_entry.runtime_data.diagnostics
     entry_id = config_entry.entry_id
-    entities.append(MilesightForwarderBinarySensor(diagnostics, entry_id))
+    entities.append(MilesightOnlineBinarySensor(coordinator, entry_id))
+    # The forwarder state comes from the network server, behind its login.
+    if gateway_only(config_entry.data):
+        remove_switched_off_entity(
+            hass, "binary_sensor", f"{entry_id}_packet_forwarder"
+        )
+    else:
+        entities.append(MilesightForwarderBinarySensor(diagnostics, entry_id))
     # Links and fleet gateways are only known once the status was read.
     if diagnostics.data is not None:
         network = diagnostics.data.network
@@ -96,8 +107,40 @@ async def async_setup_entry(
     async_add_entities(entities)
     if lorawan:
         await lorawan_platforms.async_setup_binary_sensors(
-            _hass, config_entry, async_add_entities
+            hass, config_entry, async_add_entities
         )
+
+
+class MilesightOnlineBinarySensor(
+    CoordinatorEntity[MilesightGatewayCoordinator], BinarySensorEntity
+):
+    """
+    Whether the gateway answered the last poll.
+
+    Off instead of unavailable when it does not, since that is the state this
+    entity reports. A gateway-only entry polls the login check, every other
+    entry the device list.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Online"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, coordinator: MilesightGatewayCoordinator, entry_id: str) -> None:
+        """Attach the state to the gateway device."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry_id}_online"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, entry_id)})
+
+    @property
+    def available(self) -> bool:
+        """Always available; an unreachable gateway shows as off."""
+        return True
+
+    @property
+    def is_on(self) -> bool:
+        """Return whether the last poll reached the gateway."""
+        return self.coordinator.last_update_success
 
 
 class _StatusBinarySensor(

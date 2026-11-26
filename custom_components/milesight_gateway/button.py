@@ -21,7 +21,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 
 from . import lorawan_platforms
-from .const import CONF_GATEWAY_URL, SOURCE_LORAWAN, data_source
+from .const import CONF_GATEWAY_URL, uses_lorawan
 from .entity import MilesightDeviceEntity
 
 if TYPE_CHECKING:
@@ -84,7 +84,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Create button entities for every known command of each device."""
-    if data_source(config_entry.options) == SOURCE_LORAWAN:
+    if uses_lorawan(config_entry.data, config_entry.options):
         await lorawan_platforms.async_setup_buttons(
             _hass, config_entry, async_add_entities
         )

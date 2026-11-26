@@ -102,6 +102,7 @@ _KEYS: dict[str, SensorDeviceClass] = {
     "co2": SensorDeviceClass.CO2,
     "pm2_5": SensorDeviceClass.PM25,
     "pm10": SensorDeviceClass.PM10,
+    "rssi": SensorDeviceClass.SIGNAL_STRENGTH,
 }
 # Words in a field ID -> binary sensor class, first match wins.
 _BINARY: tuple[tuple[str, BinarySensorDeviceClass], ...] = (
@@ -178,7 +179,9 @@ def setting_kind(key: str, field: dict[str, Any]) -> dict[str, Any]:
 def sensor_kind(key: str, field: dict[str, Any]) -> dict[str, Any]:
     """Entity description arguments for a non-binary field."""
     kind: dict[str, Any] = {"name": field.get("name") or key}
-    if key in INFO_FIELDS:
+    # "diagnostic" marks fields outside the catalog, such as the radio values
+    # a payload codec adds on MQTT.
+    if key in INFO_FIELDS or field.get("diagnostic"):
         kind["entity_category"] = EntityCategory.DIAGNOSTIC
     if field.get("type") == "ENUM" and field.get("values"):
         kind["device_class"] = SensorDeviceClass.ENUM

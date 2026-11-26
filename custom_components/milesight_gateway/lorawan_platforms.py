@@ -34,6 +34,7 @@ from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
+    SensorStateClass,
 )
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.const import (
@@ -74,7 +75,7 @@ Make = Callable[[MilesightLoRaWANCoordinator, str, dict[str, Any]], Any]
 def _for_each_device(
     entry: ConfigEntry, setup: Callable[[MilesightLoRaWANCoordinator], None]
 ) -> None:
-    entry.async_on_unload(entry.runtime_data.lorawan.subscribe_coordinator_added(setup))
+    entry.async_on_unload(entry.runtime_data.devices.subscribe_coordinator_added(setup))
 
 
 def _readings(
@@ -223,10 +224,48 @@ class MilesightLoRaWANLastSeen(MilesightLoRaWANEntity, SensorEntity):
         return uplink.received_at if uplink else None
 
 
+# Keys as the MQTT source names them, so switching keeps the history.
+SIGNAL_SENSORS: tuple[SensorEntityDescription, ...] = (
+    SensorEntityDescription(
+        key="rssi",
+        name="RSSI",
+        device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+        native_unit_of_measurement="dBm",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorEntityDescription(
+        key="loRaSNR",
+        name="LoRa SNR",
+        icon="mdi:signal",
+        native_unit_of_measurement="dB",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+
+class MilesightLoRaWANSignal(MilesightLoRaWANEntity, SensorEntity):
+    """RSSI or SNR of the newest uplink, at the gateway that heard it best."""
+
+    @property
+    def native_value(self) -> Any:
+        """The value of the strongest reception, or None before an uplink."""
+        uplink = self.coordinator.connection.last_uplinks.get(
+            self.device.descriptor.dev_eui
+        )
+        if uplink is None or not uplink.receptions:
+            return None
+        best = max(
+            uplink.receptions, key=lambda rx: rx.rssi if rx.rssi is not None else -999
+        )
+        return best.rssi if self.entity_description.key == "rssi" else best.snr
+
+
 async def async_setup_sensors(
     _hass: HomeAssistant, entry: ConfigEntry, add_entities: AddEntitiesCallback
 ) -> None:
-    """Add readings as sensors, plus each device's last-seen time."""
+    """Add readings as sensors, plus each device's last-seen time and signal."""
     _readings(
         entry,
         add_entities,
@@ -236,6 +275,15 @@ async def async_setup_sensors(
         ),
     )
     _for_each_device(entry, lambda c: add_entities([MilesightLoRaWANLastSeen(c)]))
+    # Only the packet log knows the receptions; on MQTT a payload codec may
+    # add the same values as fields, which the readings above cover.
+    if entry.runtime_data.lorawan is not None:
+        _for_each_device(
+            entry,
+            lambda c: add_entities(
+                MilesightLoRaWANSignal(c, description) for description in SIGNAL_SENSORS
+            ),
+        )
 
 
 class MilesightLoRaWANBinarySensor(_Remembered, BinarySensorEntity):

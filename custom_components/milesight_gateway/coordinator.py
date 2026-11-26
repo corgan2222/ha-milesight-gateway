@@ -47,8 +47,11 @@ from .const import (
     CONF_STATUS_INTERVAL,
     CONF_WEB_DATA,
     DEFAULT_SCAN_INTERVAL,
+    FIRMWARE_RETRY_INTERVAL,
     FIRMWARE_SCAN_INTERVAL,
+    gateway_only,
 )
+from .hostname import learn_hostname
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -80,6 +83,22 @@ def firmware_check_enabled(options: Mapping[str, Any]) -> bool:
 def selected_devices(options: Mapping[str, Any]) -> set[str]:
     """Return the EUIs the user picked; empty means every device."""
     return {eui.upper() for eui in options.get(CONF_DEVICES) or ()}
+
+
+def no_network() -> NetworkStatus:
+    """Return the network status of an entry that does not read the network server."""
+    return NetworkStatus(
+        gateway_eui=None,
+        forwarder_connected=None,
+        pending_packets=None,
+        gateways=[],
+        links=[],
+        application_count=None,
+        codec_count=None,
+        profile_count=None,
+        codec_library_version=None,
+        packets=[],
+    )
 
 
 @dataclass
@@ -120,10 +139,13 @@ class MilesightGatewayCoordinator(DataUpdateCoordinator[MilesightGatewayData]):
             iv=config_entry.data[CONF_IV],
             mqtt_base_topic=config_entry.data[CONF_GATEWAY_MQTT_BASE_TOPIC],
         )
+        self.gateway_only = gateway_only(config_entry.data)
 
     async def _async_update_data(self) -> MilesightGatewayData:
         """Authenticate if needed, then fetch the device list and device counts."""
         session: ClientSession = async_get_clientsession(self.hass)
+        if self.gateway_only:
+            return await self._async_check_gateway(session)
         try:
             if not self.api.connected:
                 await self.api.async_connect(session)
@@ -149,6 +171,22 @@ class MilesightGatewayCoordinator(DataUpdateCoordinator[MilesightGatewayData]):
                 offline_count=offline_count,
                 matched=devices,
             )
+
+    async def _async_check_gateway(
+        self, session: ClientSession
+    ) -> MilesightGatewayData:
+        """
+        Check that a gateway-only entry's gateway answers; it has no device list.
+
+        The web interface's login check needs no login, so no failed network
+        server login piles up towards the gateway's account lock.
+        """
+        try:
+            await self.api.async_get_gateway_info(session)
+        except (APIAuthError, APIConnectionError) as err:
+            msg = f"Cannot reach gateway: {err}"
+            raise UpdateFailed(msg) from err
+        return MilesightGatewayData(devices=[], online_count=0, offline_count=0)
 
 
 @dataclass
@@ -196,8 +234,12 @@ class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
                 else None
             )
         except (APIAuthError, APIConnectionError) as err:
+            # A busy start (a fleet hub loading hundreds of devices) can time
+            # this out; without a retry the entity would wait 12 hours.
+            self.update_interval = FIRMWARE_RETRY_INTERVAL
             msg = f"Cannot read the firmware versions: {err}"
             raise UpdateFailed(msg) from err
+        self.update_interval = FIRMWARE_SCAN_INTERVAL
         return FirmwareData(installed=info.firmware, latest=latest)
 
     async def _async_get_details(self, session: ClientSession) -> GatewayDetails | None:
@@ -226,6 +268,10 @@ class MilesightFirmwareCoordinator(DataUpdateCoordinator[FirmwareData]):
             serial_number=(details and details.serial_number) or device.serial_number,
             hw_version=(details and details.hw_version) or device.hw_version,
         )
+        if self.config_entry is not None:
+            learn_hostname(
+                self.hass, self.config_entry, device.id, details and details.hostname
+            )
 
 
 @dataclass
@@ -261,6 +307,7 @@ class MilesightDiagnosticsCoordinator(DataUpdateCoordinator[DiagnosticsData]):
         )
         self.api = api
         self.web_data = web_data_enabled(config_entry.options)
+        self.gateway_only = gateway_only(config_entry.data)
         self._seen_packets: set[tuple[str, ...]] = set()
         self._last_refresh: datetime | None = None
         self._last_uplinks: dict[str, Packet] = {}
@@ -268,17 +315,28 @@ class MilesightDiagnosticsCoordinator(DataUpdateCoordinator[DiagnosticsData]):
     async def _async_update_data(self) -> DiagnosticsData:
         """Read the status calls and count the packets since the last refresh."""
         session: ClientSession = async_get_clientsession(self.hass)
-        try:
-            network = await self.api.async_get_network_status(session)
-        except (APIAuthError, APIConnectionError) as err:
-            msg = f"Cannot read the gateway status: {err}"
-            raise UpdateFailed(msg) from err
+        if self.gateway_only:
+            # The network server's status calls need its login; only the web
+            # interface's system status is read.
+            network = no_network()
+        else:
+            try:
+                network = await self.api.async_get_network_status(session)
+            except (APIAuthError, APIConnectionError) as err:
+                msg = f"Cannot read the gateway status: {err}"
+                raise UpdateFailed(msg) from err
 
         system = None
         if self.web_data and not self.api.web_login_refused:
             try:
                 system = await self.api.async_get_system_status(session)
-            except (APIAuthError, APIConnectionError) as err:
+            except APIConnectionError as err:
+                if self.gateway_only:
+                    # Its only status call: unavailable, not quietly empty.
+                    msg = f"Cannot read the gateway status: {err}"
+                    raise UpdateFailed(msg) from err
+                _LOGGER.debug("Cannot read the gateway system status: %s", err)
+            except APIAuthError as err:
                 _LOGGER.debug("Cannot read the gateway system status: %s", err)
 
         now = dt_util.utcnow()

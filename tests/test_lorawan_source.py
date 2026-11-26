@@ -11,7 +11,9 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity import EntityCategory
 from lorawan_connection import (
     AddedEvent,
     DeviceDescriptor,
@@ -207,6 +209,24 @@ async def test_switching_keeps_shared_entities(hass, mqtt_entry, connection):
     assert hass.states.get(TEMPERATURE).state == "24.3"
     # The VS321 codec has no door contact: no entity left behind.
     assert registry.async_get(DOOR) is None
+
+
+async def test_rssi_and_snr_come_from_the_packet_log(hass, mqtt_entry, connection):
+    """The strongest reception of the newest uplink, under the MQTT keys."""
+    registry = er.async_get(hass)
+    fake = await _switch_to_lorawan(hass, mqtt_entry)
+    fake.uplink(REPORT)
+    await hass.async_block_till_done()
+
+    for key, value in (("rssi", "-80.0"), ("loRaSNR", "9.5")):
+        entity_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"24E124123456789A_{key}"
+        )
+        assert entity_id is not None, key
+        assert hass.states.get(entity_id).state == value
+        assert registry.async_get(entity_id).entity_category is (
+            EntityCategory.DIAGNOSTIC
+        )
 
 
 async def test_switching_back_removes_lorawan_only_entities(
@@ -416,3 +436,51 @@ async def test_the_network_command_lists_gateways_and_receptions(
     (device,) = item["devices"]
     assert device["dev_eui"] == EUI
     assert device["receptions"] == [{"gateway_id": GATEWAY, "rssi": -80.0, "snr": 9.5}]
+    # A double click on the map opens these devices.
+    assert item["device_id"] == mqtt_entry.runtime_data.gateway_device_id
+    registry = dr.async_get(hass)
+    assert registry.async_get(device["device_id"]).identifiers == {
+        (DOMAIN, EUI.upper())
+    }
+    assert device["selected"] is True
+    assert device["stored"] is False
+
+
+async def test_the_map_starts_from_the_stored_receptions(
+    hass, hass_ws_client, mqtt_entry, connection
+):
+    """After a restart the newest receptions come from the store until fresh ones."""
+    fake = await _switch_to_lorawan(hass, mqtt_entry)
+    fake.uplink(REPORT)
+    client = await hass_ws_client(hass)
+    await client.send_json({"id": 1, "type": f"{DOMAIN}/network"})
+    await client.receive_json()
+
+    fake.last_uplinks.clear()  # as after a restart
+    await client.send_json({"id": 2, "type": f"{DOMAIN}/network"})
+    reply = await client.receive_json()
+
+    (device,) = reply["result"]["connections"][0]["devices"]
+    assert device["stored"] is True
+    assert device["receptions"] == [{"gateway_id": GATEWAY, "rssi": -80.0, "snr": 9.5}]
+
+
+async def test_one_gateway_can_take_the_map_out_of_the_sidebar(hass):
+    """One menu entry for all gateways; off at one LoRaWAN entry removes it."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.milesight_gateway.const import CONF_NETWORK_PANEL
+    from custom_components.milesight_gateway.network import show_in_sidebar
+
+    lorawan = {CONF_DATA_SOURCE: SOURCE_LORAWAN}
+    MockConfigEntry(domain=DOMAIN, data={}, options=lorawan).add_to_hass(hass)
+    # An MQTT entry has no say: the map shows LoRaWAN entries only.
+    MockConfigEntry(
+        domain=DOMAIN, data={}, options={CONF_NETWORK_PANEL: False}
+    ).add_to_hass(hass)
+    assert show_in_sidebar(hass) is True
+
+    MockConfigEntry(
+        domain=DOMAIN, data={}, options={**lorawan, CONF_NETWORK_PANEL: False}
+    ).add_to_hass(hass)
+    assert show_in_sidebar(hass) is False

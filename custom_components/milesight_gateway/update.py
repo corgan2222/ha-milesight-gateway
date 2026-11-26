@@ -35,8 +35,12 @@ async def async_setup_entry(
         config_entry.runtime_data.gateway_device_id,
     )
     # Not a first refresh: an unreachable download page must not stop setup.
-    # It also fills the gateway device's model and firmware.
-    await coordinator.async_refresh()
+    # It also fills the gateway device's model and firmware. In the background:
+    # the web login, the summary and the download page can take over the 60 s
+    # Home Assistant gives a platform while a fleet hub loads at the same time.
+    config_entry.async_create_background_task(
+        hass, coordinator.async_refresh(), "Read the Milesight gateway firmware"
+    )
     # ponytail: without the entity the coordinator has no listener and reads
     # only at setup, so the device's firmware updates on the next start; give
     # it its own listener if that ever matters.

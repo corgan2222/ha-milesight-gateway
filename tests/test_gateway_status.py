@@ -20,6 +20,7 @@ from custom_components.milesight_gateway.api import (
     GatewayDetails,
     MilesightGatewayAPI,
     SystemStatus,
+    fleet_role,
 )
 
 GATEWAY = "http://192.0.2.11"
@@ -191,6 +192,99 @@ async def test_system_status_is_parsed(hass, aioclient_mock):
     assert status == SystemStatus(
         cpu_load=3.0, memory_available=25.2, storage_available=80.25, uptime=5087048
     )
+
+
+@pytest.mark.parametrize(
+    ("free", "total", "expected"),
+    [
+        (25, 256, 9.77),
+        ("25", "256", 9.77),
+        (25, 0, None),
+        (300, 256, None),
+        (None, 256, None),
+    ],
+)
+async def test_memory_from_free_and_total(hass, aioclient_mock, free, total, expected):
+    """A UG63 reports free and total megabytes instead of a percentage."""
+    system = {k: v for k, v in SYSTEM.items() if k != "memory_avail_percent"}
+    system |= {"memory_free": free, "memory_total": total}
+    summary = {"status": 0, "result": [{"get": [{"type": "system", "value": system}]}]}
+    aioclient_mock.post(f"{GATEWAY}/cgi", side_effect=_Web(queries=[summary]))
+
+    status = await _api().async_get_system_status(async_get_clientsession(hass))
+
+    assert status.memory_available == expected
+
+
+async def test_the_hostname_is_read_from_newer_firmware(hass, aioclient_mock):
+    """From 60.0.0.50 on the summary names the gateway's hostname."""
+    summary = {
+        "status": 0,
+        "result": [
+            {"get": [{"type": "system", "value": {**SYSTEM, "hostname": "GW-8"}}]}
+        ],
+    }
+    aioclient_mock.post(f"{GATEWAY}/cgi", side_effect=_Web(queries=[summary]))
+
+    details = await _api().async_get_gateway_details(async_get_clientsession(hass))
+
+    assert details.hostname == "GW-8"
+
+
+def _forwarder(*destinations: tuple[bool, str]) -> dict:
+    return {
+        "destinations": [
+            {"serv_enabled": enabled, "serv_addr": address}
+            for enabled, address in destinations
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("system", "expected"),
+    [
+        # Counts fleet gateways: it runs the network server for them.
+        ({"gateway_fleet_total": 8, "packet_forwarder": _forwarder()}, "master"),
+        ({"gateway_fleet_total": "3"}, "master"),
+        # Forwards to a network server elsewhere.
+        (
+            {
+                "gateway_fleet_total": 0,
+                "packet_forwarder": _forwarder(
+                    (False, "localhost"), (True, "192.0.2.20")
+                ),
+            },
+            "node",
+        ),
+        # Forwards only to its own network server.
+        (
+            {
+                "gateway_fleet_total": 0,
+                "packet_forwarder": _forwarder((True, "localhost")),
+            },
+            "standalone",
+        ),
+        # A disabled remote destination makes no node.
+        (
+            {
+                "packet_forwarder": _forwarder(
+                    (True, "127.0.0.1"), (False, "192.0.2.20")
+                )
+            },
+            "standalone",
+        ),
+        # UG63 and firmware 60.0.0.48 report neither block.
+        ({}, None),
+        ({"packet_forwarder": "?"}, None),
+        (
+            {"gateway_fleet_total": None, "packet_forwarder": {"destinations": "?"}},
+            "standalone",
+        ),
+    ],
+)
+def test_fleet_role(system, expected):
+    """The summary tells a fleet master from a node and a standalone gateway."""
+    assert fleet_role(system) == expected
 
 
 async def test_unusable_system_values_are_none(hass, aioclient_mock):

@@ -14,7 +14,7 @@ from homeassistant.components.event import EventDeviceClass, EventEntity
 from homeassistant.core import HomeAssistant, callback
 
 from . import lorawan_platforms
-from .const import CONF_GATEWAY_URL, SOURCE_LORAWAN, data_source
+from .const import CONF_GATEWAY_URL
 from .entity import MilesightDeviceEntity
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Create event entities for all event-platform entities."""
-    if data_source(config_entry.options) == SOURCE_LORAWAN:
+    if config_entry.runtime_data.devices is not None:
         await lorawan_platforms.async_setup_events(
             _hass, config_entry, async_add_entities
         )

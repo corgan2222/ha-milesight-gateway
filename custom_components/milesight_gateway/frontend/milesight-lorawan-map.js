@@ -20,6 +20,34 @@ const SVG = "http://www.w3.org/2000/svg";
 const LABEL_MIN_SCALE = 0.45;
 const NAME_MIN_SCALE = 0.3;
 const SCALE_KEY = "milesight-lorawan-map-scale";
+// Where the devices settled, so the next visit starts from that picture
+// instead of laying out hundreds of devices again.
+const POSITIONS_KEY = "milesight-lorawan-map-positions";
+const FILTER_KEY = "milesight-lorawan-map-filter";
+const TOOLS_KEY = "milesight-lorawan-map-tools";
+
+// Device dot colours by state.
+const DEVICE_COLOR = {
+  heard: "#2196f3", // an uplink since the start, or the stored one before it
+  waiting: "#fbc02d", // no uplink known yet
+  offline: "#757575", // the network server counts it inactive
+};
+
+function readStorage(key, fallback) {
+  try {
+    return JSON.parse(localStorage.getItem(key)) || fallback;
+  } catch (_err) {
+    return fallback; // no storage (private window)
+  }
+}
+
+function writeStorage(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (_err) {
+    // Not remembered; the map works the same.
+  }
+}
 
 // Worst of RSSI and SNR class wins. RSSI in dBm, SNR in dB.
 const QUALITY = [
@@ -67,12 +95,12 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
     this._dragNode = null;
     this._stats = { frames: 0, since: 0, fps: 0, tickMs: 0, updateMs: 0 };
     // Stem lengths from the sliders: hub to gateway, gateway to device.
-    this._scale = { ring: 1, stem: 1.5 };
-    try {
-      Object.assign(this._scale, JSON.parse(localStorage.getItem(SCALE_KEY)) || {});
-    } catch (_err) {
-      // No storage (private window): the defaults hold.
-    }
+    this._scale = { ring: 1, stem: 1.5, ...readStorage(SCALE_KEY, {}) };
+    // Which devices show: offline ones (on), ones without entities (off).
+    this._filter = { offline: true, unselected: false, ...readStorage(FILTER_KEY, {}) };
+    this._stored = readStorage(POSITIONS_KEY, {});
+    // The controls row starts folded away.
+    this._toolsOpen = readStorage(TOOLS_KEY, false) === true;
   }
 
   set hass(hass) {
@@ -129,24 +157,36 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
     };
     const connections = this._connections || [];
     for (const conn of connections) {
-      add({ id: `c:${conn.entry_id}`, kind: "conn", label: conn.title, group: conn.entry_id });
+      add({ id: `c:${conn.entry_id}`, kind: "conn", label: conn.title, group: conn.entry_id, deviceId: conn.device_id });
     }
     for (const conn of connections) {
       for (const gw of conn.gateways) {
         add({
           id: `g:${gw.id}`, kind: "gw", label: gw.name || gw.id, sub: gw.name ? gw.id : "",
           online: gw.connected !== false, lastSeen: gw.last_seen, group: conn.entry_id,
+          deviceId: gw.device_id,
         });
         links.push({ source: `c:${conn.entry_id}`, target: `g:${gw.id}`, kind: "backhaul", online: gw.connected !== false });
       }
     }
+    const { offline, unselected } = this._filter;
     const devices = connections.flatMap((conn) =>
-      conn.devices.map((dev) => ({ ...dev, group: conn.entry_id }))
+      conn.devices
+        // Older data carries neither flag: such a device is selected and active.
+        .filter((dev) => (unselected || dev.selected !== false) && (offline || dev.active !== false))
+        .map((dev) => ({ ...dev, group: conn.entry_id }))
     );
     for (const dev of devices) {
       const group = dev.group;
       const id = `d:${group}:${dev.dev_eui}`;
-      add({ id, kind: "dev", label: dev.name, sub: dev.model, group, lastUplink: dev.last_uplink });
+      let state = "heard";
+      if (dev.active === false) state = "offline";
+      // Uplinks of a device without entities are not followed: no "waiting".
+      else if (!dev.last_uplink && dev.selected !== false) state = "waiting";
+      add({
+        id, kind: "dev", label: dev.name, sub: dev.model, group, lastUplink: dev.last_uplink,
+        state, stored: dev.stored, selected: dev.selected !== false, deviceId: dev.device_id,
+      });
       if (!dev.receptions.length) {
         links.push({ source: `c:${group}`, target: id, kind: "none" });
         continue;
@@ -179,6 +219,14 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
     this._nodes = new Map();
     for (const fresh of graph.nodes) {
       const node = previous.get(fresh.id);
+      const kept = this._stored[fresh.id];
+      if (!node && fresh.kind === "dev" && kept) {
+        // Where it settled last time; the layout only nudges it from there.
+        [fresh.x, fresh.y] = kept;
+        fresh.vx = 0;
+        fresh.vy = 0;
+        fresh.fromStore = true;
+      }
       this._nodes.set(fresh.id, node ? Object.assign(node, fresh, { x: node.x, y: node.y }) : fresh);
     }
     this._links = graph.links;
@@ -229,7 +277,7 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
     if (frame !== this._frameKey) {
       this._frameKey = frame;
       for (const node of this._devices) {
-        if (node.pinned) continue;
+        if (node.pinned || node.fromStore) continue;
         const old = node.bestGw && before.get(node.bestGw);
         const gw = node.bestGw && this._nodes.get(node.bestGw);
         if (old && gw && old.x !== undefined && node.x !== undefined) {
@@ -249,10 +297,19 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
       const strongest = (this._heardBy.get(node.id) || []).find((l) => l.best);
       const bestGw = strongest ? strongest.source : null;
       if (bestGw) this._clusterSize.set(bestGw, (this._clusterSize.get(bestGw) || 0) + 1);
-      if (node.bestGw !== bestGw) {
-        node.bestGw = bestGw;
-        if (!node.pinned) node.x = undefined;
+      if (node.fromStore && !node.pinned) {
+        // A stored position from another state (waiting inside the ring, now
+        // heard outside, or the reverse) would leave the node on the wrong side.
+        const { center, ring } = this._frameOf.get(node.group);
+        const outside = Math.hypot(node.x - center.x, node.y - center.y) >= ring;
+        if (outside !== Boolean(bestGw)) node.x = undefined;
       }
+      if (node.bestGw !== bestGw) {
+        // A stored position was taken next to this gateway already.
+        if (!node.pinned && !(node.fromStore && node.bestGw === undefined)) node.x = undefined;
+        node.bestGw = bestGw;
+      }
+      node.fromStore = false;
       if (node.x !== undefined) continue;
       fresh += 1;
       const { center, ring, outer } = this._frameOf.get(node.group);
@@ -359,7 +416,11 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
         h1 { font-size: 20px; font-weight: 400; margin: 0 16px 0 0; }
         .legend { display: flex; gap: 12px; font-size: 13px; color: var(--secondary-text-color); align-items: center; flex-wrap: wrap; }
         .swatch { display: inline-block; width: 18px; height: 4px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+        .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+        .node.unselected circle { fill-opacity: 0.35; stroke: var(--secondary-text-color); stroke-width: 1.5; }
         .spacer { flex: 1; }
+        .tools { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; width: 100%; }
+        .tools[hidden] { display: none; }
         .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
         .controls label { display: inline-flex; align-items: center; gap: 6px; }
         .meta, label { font-size: 13px; color: var(--secondary-text-color); }
@@ -379,21 +440,36 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
       <header>
         ${title ? `<h1>${title.replace(/[<>&]/g, "")}</h1>` : ""}
         <div class="legend">${QUALITY.map((q) => `<span><span class="swatch" style="background:${q.color}"></span>${q.name}</span>`).join("")}
-          <span class="panel-only">good: RSSI ≥ −100 dBm and SNR ≥ 0 dB</span></div>
+          <span class="panel-only">good: RSSI ≥ −100 dBm and SNR ≥ 0 dB</span>
+          <span><span class="dot" style="background:${DEVICE_COLOR.waiting}"></span>no uplink yet</span>
+          <span><span class="dot" style="background:${DEVICE_COLOR.offline}"></span>offline</span>
+          <span class="panel-only">double-click opens a device</span></div>
         <span class="spacer"></span>
-        <div class="controls">
-          <label title="Length of the stems from the hub to its gateways">Hub stem <input type="range" id="ring" min="0.3" max="4" step="0.1" value="${this._scale.ring}"></label>
-          <label title="Length of the stems from a gateway to its devices">Device stem <input type="range" id="stem" min="0.3" max="4" step="0.1" value="${this._scale.stem}"></label>
-          <label><input type="checkbox" id="labels" ${this._labels ? "checked" : ""}> RSSI labels</label>
-          <button id="fit">Fit</button>
-          <button id="reset" title="Forget dragged positions">Reset layout</button>
+        <button id="toggle" aria-expanded="${this._toolsOpen}" title="Show or hide the map controls">${this._toolsOpen ? "▴" : "▾"} Controls</button>
+        <div class="tools" id="tools" ${this._toolsOpen ? "" : "hidden"}>
+          <div class="controls">
+            <label title="Length of the stems from the hub to its gateways">Hub stem <input type="range" id="ring" min="0.3" max="4" step="0.1" value="${this._scale.ring}"></label>
+            <label title="Length of the stems from a gateway to its devices">Device stem <input type="range" id="stem" min="0.3" max="4" step="0.1" value="${this._scale.stem}"></label>
+            <label><input type="checkbox" id="labels" ${this._labels ? "checked" : ""}> RSSI labels</label>
+            <label title="Devices the network server counts inactive, in grey"><input type="checkbox" id="offline" ${this._filter.offline ? "checked" : ""}> Offline</label>
+            <label title="Devices of the network server that have no entities in Home Assistant (device choice in the options), with a faint ring"><input type="checkbox" id="unselected" ${this._filter.unselected ? "checked" : ""}> Not in HA</label>
+            <button id="fit">Fit</button>
+            <button id="reset" title="Forget dragged and stored positions; right-click releases one node">Reset layout</button>
+          </div>
+          <span class="meta panel-only" id="fps"></span>
+          <span class="meta panel-only" id="meta"></span>
         </div>
-        <span class="meta panel-only" id="fps"></span>
-        <span class="meta panel-only" id="meta"></span>
         <div class="error" id="error"></div>
       </header>
       <svg id="canvas" xmlns="${SVG}"><g id="viewport"><g id="links"></g><g id="linklabels"></g><g id="nodes"></g></g></svg>`;
     const root = this.shadowRoot;
+    root.getElementById("toggle").addEventListener("click", (ev) => {
+      this._toolsOpen = !this._toolsOpen;
+      writeStorage(TOOLS_KEY, this._toolsOpen);
+      root.getElementById("tools").hidden = !this._toolsOpen;
+      ev.target.textContent = `${this._toolsOpen ? "▴" : "▾"} Controls`;
+      ev.target.setAttribute("aria-expanded", String(this._toolsOpen));
+    });
     this._svg = root.getElementById("canvas");
     this._viewport = root.getElementById("viewport");
     this._linkLayer = root.getElementById("links");
@@ -427,10 +503,22 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
     });
     root.getElementById("reset").addEventListener("click", () => {
       this._moved.clear();
-      for (const node of this._nodes.values()) node.pinned = false;
-      this._frameKey = null; // place every device anew
+      this._stored = {};
+      writeStorage(POSITIONS_KEY, {});
+      for (const node of this._nodes.values()) {
+        node.pinned = false;
+        if (node.kind === "dev") node.x = undefined; // place every device anew
+      }
+      this._frameKey = null;
       this._update();
     });
+    for (const key of ["offline", "unselected"]) {
+      root.getElementById(key).addEventListener("change", (ev) => {
+        this._filter[key] = ev.target.checked;
+        writeStorage(FILTER_KEY, this._filter);
+        this._update();
+      });
+    }
     this._fpsEl = root.getElementById("fps");
     this._meter();
     this._bindPanZoom();
@@ -471,9 +559,17 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
   _bindPanZoom() {
     const svg = this._svg;
     let drag = null;
+    // The node under the last press. Pointer capture sends the click events
+    // that follow to the canvas, not to the node.
+    let pressed = null;
+    const nodeAt = (ev) => {
+      const hit = ev.target.closest && ev.target.closest("[data-id]");
+      return (hit && this._nodes.get(hit.getAttribute("data-id"))) || pressed;
+    };
     svg.addEventListener("pointerdown", (ev) => {
       const hit = ev.target.closest && ev.target.closest("[data-id]");
       const node = hit && this._nodes.get(hit.getAttribute("data-id"));
+      pressed = node || null;
       if (node) {
         // Drag a node; the rest of its cluster follows the springs.
         this._dragNode = node;
@@ -508,10 +604,15 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
       this._requestView();
     });
     svg.addEventListener("dblclick", (ev) => {
+      // Open the device in Home Assistant: a sensor, a gateway, a hub.
+      const node = nodeAt(ev);
+      if (node) this._openDevice(node);
+    });
+    svg.addEventListener("contextmenu", (ev) => {
       // Let a dragged node go back to where the layout wants it.
-      const hit = ev.target.closest && ev.target.closest("[data-id]");
-      const node = hit && this._nodes.get(hit.getAttribute("data-id"));
+      const node = nodeAt(ev);
       if (!node) return;
+      ev.preventDefault();
       node.pinned = false;
       this._nodeEls.get(node.id)?.g.classList.remove("pinned");
       if (this._moved.delete(node.id)) this._update();
@@ -519,6 +620,7 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
       this._animate();
     });
     const stop = () => {
+      if (drag && drag.node) this._savePositions();
       drag = null;
       this._dragNode = null;
       svg.classList.remove("dragging");
@@ -606,6 +708,7 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
         // Settled after a stem change: frame the new size, unless zoomed by hand.
         if (this._refit && !this._userView) this._fit();
         this._refit = false;
+        this._savePositions();
         return;
       }
       const started = performance.now();
@@ -616,6 +719,22 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
       this._frame = requestAnimationFrame(tick);
     };
     this._frame = requestAnimationFrame(tick);
+  }
+
+  _savePositions() {
+    for (const node of this._nodes.values()) {
+      if (node.kind === "dev" && Number.isFinite(node.x)) {
+        this._stored[node.id] = [Math.round(node.x), Math.round(node.y)];
+      }
+    }
+    writeStorage(POSITIONS_KEY, this._stored);
+  }
+
+  // Open the device page in Home Assistant's own navigation.
+  _openDevice(node) {
+    if (!node.deviceId) return;
+    history.pushState(null, "", `/config/devices/device/${node.deviceId}`);
+    window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
   }
 
   // Create, update and drop elements; positions come in _draw().
@@ -642,7 +761,16 @@ class MilesightLorawanNetworkPanel extends HTMLElement {
         item.shape.setAttribute("fill", node.online ? "#00897b" : "#757575");
         item.title.textContent = `${node.label}${node.sub ? ` (${node.sub})` : ""}${node.lastSeen ? `\nlast seen ${node.lastSeen}` : ""}${node.online ? "" : "\noffline"}`;
       } else if (node.kind === "dev") {
-        item.title.textContent = `${node.label} (${node.sub || "?"})${node.lastUplink ? `\nlast uplink ${node.lastUplink}` : "\nno uplink yet"}`;
+        item.shape.setAttribute("fill", DEVICE_COLOR[node.state] || DEVICE_COLOR.heard);
+        item.g.classList.toggle("unselected", !node.selected);
+        const uplink = node.lastUplink
+          ? `\nlast uplink ${node.lastUplink}${node.stored ? " (before the restart)" : ""}`
+          : "\nno uplink yet";
+        item.title.textContent =
+          `${node.label} (${node.sub || "?"})${uplink}` +
+          `${node.state === "offline" ? "\noffline" : ""}` +
+          `${node.selected ? "" : "\nno entities in Home Assistant"}` +
+          `${node.deviceId ? "\ndouble-click to open" : ""}`;
       } else {
         item.title.textContent = node.label;
       }

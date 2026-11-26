@@ -51,8 +51,11 @@ from custom_components.milesight_gateway.api import (
 from custom_components.milesight_gateway.const import (
     CONF_DEVICES,
     CONF_FIRMWARE_CHECK,
+    CONF_GATEWAY_ONLY,
     CONF_GATEWAY_URL,
     CONF_IV,
+    CONF_MAC,
+    CONF_MODEL,
     CONF_SECRET_KEY,
     CONF_STATUS_INTERVAL,
     CONF_WEB_DATA,
@@ -508,6 +511,25 @@ async def test_an_unreachable_web_interface_is_retried(hass, entry, firmware):
     assert hass.states.get(FIRMWARE).state == STATE_ON
 
 
+async def test_a_failed_firmware_check_is_retried_soon(
+    hass, mqtt, get_devices, firmware, freezer
+):
+    """A check that times out at a busy start comes back in minutes, not 12 h."""
+    firmware[0].side_effect = APIConnectionError("Timeout talking to gateway")
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, version=1, minor_version=2)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(FIRMWARE).state == STATE_UNAVAILABLE
+
+    firmware[0].side_effect = None
+    freezer.tick(timedelta(minutes=6))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(FIRMWARE).state == STATE_ON
+
+
 @pytest.mark.parametrize(
     ("installed", "expected"), [("60.0.0.50", "off"), ("60.0.0.50-r1", "off")]
 )
@@ -818,3 +840,63 @@ async def test_a_failed_firmware_check_does_not_block_setup(
     assert entry.state is ConfigEntryState.LOADED
     assert hass.states.get(FIRMWARE).state == STATE_UNAVAILABLE
     assert hass.states.get(TEMPERATURE).state == STATE_UNKNOWN
+
+
+async def test_gateway_only_entry_never_tries_the_network_login(
+    hass, mqtt, firmware, status
+):
+    """A gateway-only entry loads via the login check, not the network login.
+
+    Failed network server logins lock the gateway's account, so the mode must
+    never reach that login: not at setup and not on a later poll.
+    """
+    connect = AsyncMock(return_value=True)
+    no_devices = AsyncMock(side_effect=AssertionError("must not fetch the device list"))
+    with (
+        patch.object(MilesightGatewayAPI, "async_connect", connect),
+        patch.object(MilesightGatewayAPI, "async_get_devices", no_devices),
+        patch.object(MilesightGatewayAPI, "async_get_network_status", no_devices),
+        patch(
+            "custom_components.milesight_gateway.sensor._tcp_ping",
+            AsyncMock(return_value=5.0),
+        ),
+    ):
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                **ENTRY_DATA,
+                CONF_GATEWAY_ONLY: True,
+                CONF_MAC: "24:e1:24:00:00:01",
+                CONF_MODEL: "UG63",
+            },
+            version=1,
+            minor_version=2,
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    connect.assert_not_called()
+
+    registry = er.async_get(hass)
+    eid = entry.entry_id
+
+    def has(platform: str, key: str) -> bool:
+        uid = f"{eid}_{key}"
+        return registry.async_get_entity_id(platform, DOMAIN, uid) is not None
+
+    # The gateway itself: reachable, firmware, and the web-interface values.
+    assert has("binary_sensor", "online")
+    assert has("update", "firmware")
+    assert has("sensor", "cpu_load")
+    assert has("sensor", "last_boot")
+    # Nothing that needs the network server login.
+    assert not has("sensor", "online_devices")
+    assert not has("sensor", "offline_devices")
+    assert not has("binary_sensor", "packet_forwarder")
+    assert not has("sensor", "uplinks_per_minute")
+    assert _gateway_device(hass, entry).name == "Milesight UG63"
+    # The MAC lets DHCP discovery find the gateway again at a new address.
+    assert (dr.CONNECTION_NETWORK_MAC, "24:e1:24:00:00:01") in _gateway_device(
+        hass, entry
+    ).connections

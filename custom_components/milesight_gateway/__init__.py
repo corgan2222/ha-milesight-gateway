@@ -8,17 +8,28 @@ from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.start import async_at_started
 
-from .const import CONF_GATEWAY_URL, DOMAIN, SOURCE_LORAWAN, data_source
+from .const import (
+    CONF_GATEWAY_URL,
+    CONF_MAC,
+    DOMAIN,
+    gateway_name,
+    gateway_only,
+    uses_lorawan,
+    uses_mqtt_discovery,
+)
 from .coordinator import MilesightDiagnosticsCoordinator, MilesightGatewayCoordinator
+from .hostname import learn_hostname
 from .lorawan import LoRaWANRuntime
 from .lorawan_cleanup import remove_lorawan_only_entities, remove_mqtt_only_entities
+from .mqtt_discovery import MqttDiscoveryRuntime
 from .network import async_setup_network_view
 
 if TYPE_CHECKING:
-    from homeassistant.core import HomeAssistant
     from homeassistant.helpers.device_registry import DeviceEntry
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,6 +63,13 @@ class RuntimeData:
     diagnostics: MilesightDiagnosticsCoordinator
     # Set when the data source is LoRaWAN; MQTT entries leave it None.
     lorawan: LoRaWANRuntime | None = None
+    # Set for a gateway-only entry that finds its devices on MQTT.
+    mqtt: MqttDiscoveryRuntime | None = None
+
+    @property
+    def devices(self) -> LoRaWANRuntime | MqttDiscoveryRuntime | None:
+        """The source of catalog-built device entities, if the entry has one."""
+        return self.lorawan or self.mqtt
 
 
 async def async_migrate_entry(
@@ -109,7 +127,10 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: MilesightGatewayConfigEntry
 ) -> bool:
     """Set up Milesight Gateway from a config entry."""
-    if data_source(entry.options) != SOURCE_LORAWAN:
+    only_gateway = gateway_only(entry.data)
+    lorawan_source = uses_lorawan(entry.data, entry.options)
+    # A gateway-only entry has no device entities, so it needs no broker either.
+    if not only_gateway and not lorawan_source:
         # MQTT is only an after-dependency, so LoRaWAN entries need no broker;
         # an MQTT entry waits for it here instead.
         from homeassistant.components import mqtt  # noqa: PLC0415
@@ -121,7 +142,7 @@ async def async_setup_entry(
 
     await coordinator.async_config_entry_first_refresh()
 
-    if not coordinator.api.connected:
+    if not only_gateway and not coordinator.api.connected:
         raise ConfigEntryNotReady
 
     # Register the gateway as a device so sensor devices can link to it
@@ -132,7 +153,11 @@ async def async_setup_entry(
     gateway_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
-        name="Milesight Gateway",
+        # Lets DHCP discovery recognise the gateway at a new address.
+        connections={(dr.CONNECTION_NETWORK_MAC, mac)}
+        if (mac := entry.data.get(CONF_MAC))
+        else set(),
+        name=gateway_name(entry.data) or "Milesight Gateway",
         manufacturer="Milesight",
         model="LoRaWAN Gateway",
         configuration_url=gateway_url,
@@ -140,13 +165,21 @@ async def async_setup_entry(
 
     _remove_deselected_devices(hass, entry, coordinator)
 
+    # Router device trackers load during startup too; their DHCP names are
+    # there once Home Assistant has started.
+    @callback
+    def _after_start(_hass: HomeAssistant) -> None:
+        learn_hostname(hass, entry, gateway_device.id)
+
+    entry.async_on_unload(async_at_started(hass, _after_start))
+
     # Not a first refresh: the status calls must not stop the devices loading.
     diagnostics = MilesightDiagnosticsCoordinator(hass, entry, coordinator.api)
     await diagnostics.async_refresh()
 
     entry.runtime_data = RuntimeData(coordinator, gateway_device.id, diagnostics)
 
-    if data_source(entry.options) == SOURCE_LORAWAN:
+    if lorawan_source:
         lorawan = LoRaWANRuntime(hass, entry)
         try:
             await lorawan.async_start()
@@ -156,9 +189,17 @@ async def async_setup_entry(
         entry.runtime_data.lorawan = lorawan
         remove_mqtt_only_entities(hass, entry, coordinator)
         await async_setup_network_view(hass)
+    elif uses_mqtt_discovery(entry.data, entry.options):
+        found = MqttDiscoveryRuntime(hass, entry)
+        try:
+            await found.async_start()
+        except BaseException:
+            await found.async_stop()
+            raise
+        entry.runtime_data.mqtt = found
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    if entry.runtime_data.lorawan is None:
+    if entry.runtime_data.devices is None:
         remove_lorawan_only_entities(hass, entry, coordinator)
 
     return True
@@ -180,6 +221,6 @@ async def async_unload_entry(
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     # No runtime data when the setup never got that far.
     runtime = getattr(entry, "runtime_data", None)
-    if unloaded and runtime is not None and runtime.lorawan is not None:
-        await runtime.lorawan.async_stop()
+    if unloaded and runtime is not None and runtime.devices is not None:
+        await runtime.devices.async_stop()
     return unloaded
