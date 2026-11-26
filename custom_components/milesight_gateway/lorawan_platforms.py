@@ -293,13 +293,32 @@ class MilesightLoRaWANLastSeen(MilesightLoRaWANEntity, SensorEntity):
             ),
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Follow the device list too, for the network server's time."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.config_entry.runtime_data.coordinator.async_add_listener(
+                self._handle_coordinator_update
+            )
+        )
+
     @property
     def native_value(self) -> Any:
-        """The receive time of the newest uplink, or None before one."""
+        """
+        The receive time of the newest uplink.
+
+        Before Home Assistant heard one, the time the network server last
+        heard the device: a device that reports twice a day shows it after a
+        restart too.
+        """
         uplink = self.coordinator.connection.last_uplinks.get(
             self.device.descriptor.dev_eui
         )
-        return uplink.received_at if uplink else None
+        if uplink:
+            return uplink.received_at
+        listed = self.coordinator.config_entry.runtime_data.coordinator.data
+        known = listed.by_eui.get(device_eui(self.device)) if listed else None
+        return known.last_seen if known else None
 
 
 class MilesightCommandStatus(MilesightLoRaWANEntity, SensorEntity):

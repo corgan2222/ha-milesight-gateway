@@ -7,6 +7,7 @@ the bundled Milesight codecs.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -32,6 +33,7 @@ from custom_components.milesight_gateway.const import (
 )
 
 from .test_platforms import (  # noqa: F401  fixtures, found by their own names
+    DEVICE,
     TEMPERATURE,
     TOPIC,
     expected_lingering_timers,
@@ -518,3 +520,22 @@ async def test_one_gateway_can_take_the_map_out_of_the_sidebar(hass):
         domain=DOMAIN, data={}, options={**lorawan, CONF_NETWORK_PANEL: False}
     ).add_to_hass(hass)
     assert show_in_sidebar(hass) is False
+
+
+async def test_last_seen_comes_from_the_network_server_until_an_uplink(
+    hass, mqtt_entry, connection, get_devices
+):
+    """After a restart a rarely reporting device shows when the gateway heard it."""
+    seen = datetime(2026, 11, 20, 8, 0, tzinfo=UTC)
+    get_devices.return_value = ([replace(DEVICE, last_seen=seen)], 1, 0)
+    fake = await _switch_to_lorawan(hass, mqtt_entry)
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, "24E124123456789A_last_seen"
+    )
+
+    assert hass.states.get(entity_id).state == seen.isoformat()
+
+    fake.uplink(REPORT)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity_id).state == "2026-11-24T12:00:00+00:00"

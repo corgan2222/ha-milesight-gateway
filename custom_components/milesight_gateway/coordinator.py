@@ -12,6 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -120,6 +121,11 @@ class MilesightGatewayData:
     offline_count: int
     # Every active device with a known model, to choose from in the options.
     matched: list[MilesightDevice] = field(default_factory=list)
+
+    @cached_property
+    def by_eui(self) -> dict[str, MilesightDevice]:
+        """The listed devices by upper-case devEUI."""
+        return {device.dev_eui.upper(): device for device in self.matched}
 
 
 class MilesightGatewayCoordinator(DataUpdateCoordinator[MilesightGatewayData]):

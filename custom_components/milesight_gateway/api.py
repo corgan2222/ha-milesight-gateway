@@ -56,6 +56,8 @@ class MilesightDevice:
     # Minutes without an uplink after which the network server calls the
     # device offline; its own setting per device.
     timeout: int = DEVICE_TIMEOUT
+    # When the network server last heard the device, joins included.
+    last_seen: datetime | None = None
 
 
 def _timeout(value: Any) -> int:
@@ -63,6 +65,24 @@ def _timeout(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return DEVICE_TIMEOUT
     return int(value) if value > 0 else DEVICE_TIMEOUT
+
+
+def _seen_at(value: Any) -> datetime | None:
+    """
+    Read the network server's "2026-11-27 04:01:15.51938 +0800 CST".
+
+    The gateway writes its own clock's zone, which may be far from the
+    house; the offset makes the moment exact. "-" means never.
+    """
+    if not isinstance(value, str):
+        return None
+    stamp = " ".join(value.split()[:3])
+    for layout in ("%Y-%m-%d %H:%M:%S.%f %z", "%Y-%m-%d %H:%M:%S %z"):
+        try:
+            return datetime.strptime(stamp, layout)  # noqa: DTZ007 - both carry %z
+        except ValueError:
+            continue
+    return None
 
 
 def _catalog_device(raw: dict[str, Any]) -> MilesightDevice | None:
@@ -86,6 +106,7 @@ def _catalog_device(raw: dict[str, Any]) -> MilesightDevice | None:
         model_id=model_id,
         online=is_online(raw),
         timeout=_timeout(raw.get("timeout")),
+        last_seen=_seen_at(raw.get("lastSeenAtTime")),
     )
 
 

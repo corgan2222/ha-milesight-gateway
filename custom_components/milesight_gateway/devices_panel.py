@@ -264,13 +264,16 @@ def _device(
         "model_id": device.model_id,
         "device_id": registered.id if registered else None,
         # The gateway's verdict where it lists the device, as its own page shows.
+        # Without its list only what Home Assistant heard counts.
         "active": not device.closed
         and (
             heard
-            or (getattr(device, "active", True) and (known is None or known.online))
+            or (getattr(device, "active", True) and known is not None and known.online)
         ),
         "interval": stats.interval,
-        "last_seen": uplink.received_at.isoformat() if uplink else None,
+        "last_seen": uplink.received_at.isoformat()
+        if uplink
+        else (known.last_seen.isoformat() if known and known.last_seen else None),
         "battery": _number(values.get("battery")),
         "firmware": values.get("firmware_version"),
         "hardware": values.get("hardware_version"),

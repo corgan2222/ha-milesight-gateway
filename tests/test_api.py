@@ -9,6 +9,7 @@ has merely expired.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from custom_components.milesight_gateway.api import (
     APIAuthError,
     APIConnectionError,
     MilesightGatewayAPI,
+    _seen_at,
 )
 
 
@@ -330,3 +332,25 @@ async def test_an_expired_login_is_renewed_for_a_call():
     with patch.object(api, "_async_ns_call", seen):
         assert await api.async_ns_call(MagicMock(), "GET", "/api/x") == {"ok": 1}
     assert client.get_jwt_token.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "2026-11-27 04:01:15.51938 +0800 CST",
+            datetime(2026, 11, 26, 20, 1, 15, 519380, tzinfo=UTC),
+        ),
+        (
+            "2026-11-27 04:01:15 +0800 CST",
+            datetime(2026, 11, 26, 20, 1, 15, tzinfo=UTC),
+        ),
+        ("-", None),
+        ("", None),
+        (None, None),
+        (1795721123, None),
+    ],
+)
+def test_the_network_server_time_is_read_with_its_offset(value, expected):
+    """The gateway writes its own clock's zone; the moment must still be exact."""
+    assert _seen_at(value) == expected
