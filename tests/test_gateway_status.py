@@ -20,6 +20,7 @@ from custom_components.milesight_gateway.api import (
     GatewayDetails,
     MilesightGatewayAPI,
     SystemStatus,
+    fleet_role,
 )
 
 GATEWAY = "http://192.0.2.11"
@@ -51,7 +52,6 @@ def _api() -> MilesightGatewayAPI:
         password="secret",  # noqa: S106
         secret_key="1111111111111111",  # noqa: S106
         iv="2222222222222222",
-        mqtt_base_topic="sensors/lora/uplink",
     )
 
 
@@ -193,6 +193,99 @@ async def test_system_status_is_parsed(hass, aioclient_mock):
     )
 
 
+@pytest.mark.parametrize(
+    ("free", "total", "expected"),
+    [
+        (25, 256, 9.77),
+        ("25", "256", 9.77),
+        (25, 0, None),
+        (300, 256, None),
+        (None, 256, None),
+    ],
+)
+async def test_memory_from_free_and_total(hass, aioclient_mock, free, total, expected):
+    """A UG63 reports free and total megabytes instead of a percentage."""
+    system = {k: v for k, v in SYSTEM.items() if k != "memory_avail_percent"}
+    system |= {"memory_free": free, "memory_total": total}
+    summary = {"status": 0, "result": [{"get": [{"type": "system", "value": system}]}]}
+    aioclient_mock.post(f"{GATEWAY}/cgi", side_effect=_Web(queries=[summary]))
+
+    status = await _api().async_get_system_status(async_get_clientsession(hass))
+
+    assert status.memory_available == expected
+
+
+async def test_the_hostname_is_read_from_newer_firmware(hass, aioclient_mock):
+    """From 60.0.0.50 on the summary names the gateway's hostname."""
+    summary = {
+        "status": 0,
+        "result": [
+            {"get": [{"type": "system", "value": {**SYSTEM, "hostname": "GW-8"}}]}
+        ],
+    }
+    aioclient_mock.post(f"{GATEWAY}/cgi", side_effect=_Web(queries=[summary]))
+
+    details = await _api().async_get_gateway_details(async_get_clientsession(hass))
+
+    assert details.hostname == "GW-8"
+
+
+def _forwarder(*destinations: tuple[bool, str]) -> dict:
+    return {
+        "destinations": [
+            {"serv_enabled": enabled, "serv_addr": address}
+            for enabled, address in destinations
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("system", "expected"),
+    [
+        # Counts fleet gateways: it runs the network server for them.
+        ({"gateway_fleet_total": 8, "packet_forwarder": _forwarder()}, "master"),
+        ({"gateway_fleet_total": "3"}, "master"),
+        # Forwards to a network server elsewhere.
+        (
+            {
+                "gateway_fleet_total": 0,
+                "packet_forwarder": _forwarder(
+                    (False, "localhost"), (True, "192.0.2.20")
+                ),
+            },
+            "node",
+        ),
+        # Forwards only to its own network server.
+        (
+            {
+                "gateway_fleet_total": 0,
+                "packet_forwarder": _forwarder((True, "localhost")),
+            },
+            "standalone",
+        ),
+        # A disabled remote destination makes no node.
+        (
+            {
+                "packet_forwarder": _forwarder(
+                    (True, "127.0.0.1"), (False, "192.0.2.20")
+                )
+            },
+            "standalone",
+        ),
+        # UG63 and firmware 60.0.0.48 report neither block.
+        ({}, None),
+        ({"packet_forwarder": "?"}, None),
+        (
+            {"gateway_fleet_total": None, "packet_forwarder": {"destinations": "?"}},
+            "standalone",
+        ),
+    ],
+)
+def test_fleet_role(system, expected):
+    """The summary tells a fleet master from a node and a standalone gateway."""
+    assert fleet_role(system) == expected
+
+
 async def test_unusable_system_values_are_none(hass, aioclient_mock):
     """Placeholders, junk and negative uptimes are dropped."""
     junk = {**SYSTEM, "cpu_load": "-", "memory_avail_percent": 25, "uptime": -1}
@@ -253,6 +346,17 @@ NS = {
             "junk",
         ],
     },
+    # About the gateway it runs on, the network server answers with empty fields.
+    "/api/gateways/24E124FFFEF8706C": {"mac": "24E124FFFEF8706C", "networkIP": ""},
+    "/api/gateways/24E124FFFE000001": {
+        "mac": "24E124FFFE000001",
+        "wanStatus": "Connected",
+        "networkIP": "192.0.2.20",
+        "systemRuntime": "3600",
+        "systemRunningStatus": [0],
+        "cellularNetworkStatus": "Disconnected",
+        "cellularSignal": "0asu (-113dBm)",
+    },
     "/api/urapplications": {
         "totalCount": "3",
         "result": [
@@ -306,6 +410,13 @@ async def test_network_status_is_read(hass, aioclient_mock):
             name="24E124FFFE000001",
             connected=None,
             last_seen=None,
+            # What the hub knows of a member besides its radio.
+            wan_connected=True,
+            ip="192.0.2.20",
+            uptime=3600,
+            system_ok=True,
+            cellular_connected=False,
+            cellular_signal=-113,
         ),
     ]
     # Only applications with devices and an MQTT link; 3 means connected.
@@ -385,3 +496,30 @@ async def test_a_non_object_status_answer_is_a_connection_error(
 
     with pytest.raises(APIConnectionError):
         await _api().async_get_network_status(async_get_clientsession(hass))
+
+
+async def test_a_fleet_member_without_detail_keeps_the_status(hass, aioclient_mock):
+    """Older firmware has no detail call; the rest of the status still comes."""
+    _mock_ns(aioclient_mock, {"/api/gateways/24E124FFFE000001": {"status_code": 404}})
+
+    status = await _api().async_get_network_status(async_get_clientsession(hass))
+
+    member = status.gateways[1]
+    assert (member.eui, member.ip, member.wan_connected) == (
+        "24E124FFFE000001",
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, "junk", {}, {"networkIP": "0.0.0.0", "systemRuntime": "soon"}],  # noqa: S104
+)
+def test_a_fleet_detail_is_foreign_json(raw):
+    """The hub's own entry comes with empty fields; nothing of it is a value."""
+    from custom_components.milesight_gateway.api import _fleet_detail
+
+    detail = _fleet_detail(raw)
+
+    assert all(value is None for value in detail.values())

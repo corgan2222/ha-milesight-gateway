@@ -59,8 +59,17 @@ rules:
     comment: >-
       Options, matched models with their entity keys, and the gateway status.
       Credentials, addresses, serial numbers, EUIs and names are redacted.
-  discovery-update-info: todo
-  discovery: todo
+  discovery-update-info:
+    status: done
+    comment: >-
+      A discovered gateway is matched by its MAC, which is the entry's unique id
+      and a device connection; a known gateway takes the new IP. An entry added
+      by hand is matched by its address once and takes the MAC from then on.
+  discovery:
+    status: done
+    comment: >-
+      Milesight gateways are discovered by their 24:E1:24 MAC prefix over DHCP.
+      The user confirms the model the gateway reports, then enters the login.
   docs-data-update: done
   docs-examples: todo
   docs-known-limitations: done

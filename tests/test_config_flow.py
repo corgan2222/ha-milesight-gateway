@@ -24,16 +24,23 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.milesight_gateway.api import (
     APIAuthError,
     APIConnectionError,
-    _build_device,
+    GatewayDetails,
+    GatewayInfo,
+    MilesightDevice,
 )
 from custom_components.milesight_gateway.const import (
     CONF_ALL_SETTINGS,
     CONF_DATA_SOURCE,
     CONF_DEVICES,
+    CONF_DEVICES_PANEL,
     CONF_FIRMWARE_CHECK,
     CONF_GATEWAY_MQTT_BASE_TOPIC,
     CONF_GATEWAY_URL,
+    CONF_HOSTNAME,
     CONF_IV,
+    CONF_MODEL,
+    CONF_MQTT_TOPIC,
+    CONF_NETWORK_PANEL,
     CONF_SECRET_KEY,
     CONF_STATUS_INTERVAL,
     CONF_WEB_DATA,
@@ -59,22 +66,45 @@ GET_DEVICES = (
     "custom_components.milesight_gateway.config_flow."
     "MilesightGatewayAPI.async_get_devices"
 )
-THERMOSTAT = _build_device(
-    {"devEUI": "24E1247140000001", "name": "radiator"},
-    {"id": "wt101", "description": "Wireless Thermostat", "device_entities": []},
-    "sensors/lora/uplink",
+GET_DETAILS = (
+    "custom_components.milesight_gateway.config_flow."
+    "MilesightGatewayAPI.async_get_gateway_details"
 )
-BUTTON = _build_device(
-    {"devEUI": "24E1245350000002", "name": "button1"},
-    {"id": "ws101", "description": "Smart Button", "device_entities": []},
-    "sensors/lora/uplink",
+GET_INFO = (
+    "custom_components.milesight_gateway.config_flow."
+    "MilesightGatewayAPI.async_get_gateway_info"
 )
+# The second step's input: everything but the address, which the first takes.
+CREDENTIALS = {k: v for k, v in USER_INPUT.items() if k != CONF_GATEWAY_URL}
+THERMOSTAT = MilesightDevice(
+    "24E1247140000001", "radiator", "Wireless Thermostat", "wt101"
+)
+BUTTON = MilesightDevice("24E1245350000002", "button1", "Smart Button", "ws101")
 
 
 @pytest.fixture(autouse=True)
 def device_list():
     """The gateway lists no devices, so the setup skips the device choice."""
     with patch(GET_DEVICES, AsyncMock(return_value=([], 0, 0))) as mock:
+        yield mock
+
+
+@pytest.fixture(autouse=True)
+def gateway_info():
+    """The address answers /islogin as a UG65, unless a test says otherwise."""
+    with patch(
+        GET_INFO, AsyncMock(return_value=GatewayInfo(model="UG65", firmware="1"))
+    ) as mock:
+        yield mock
+
+
+DETAILS = GatewayDetails(model_id="ND65-868M-EA", serial_number=None, hw_version=None)
+
+
+@pytest.fixture(autouse=True)
+def gateway_details():
+    """The web interface takes the account and reports no hostname."""
+    with patch(GET_DETAILS, AsyncMock(return_value=DETAILS)) as mock:
         yield mock
 
 
@@ -101,17 +131,27 @@ def _entry(**overrides) -> MockConfigEntry:
 # --- user step -------------------------------------------------------------
 
 
-async def test_user_flow_creates_entry(hass, mock_setup_entry):
-    """A valid submission, then the data source, creates the entry."""
+async def _start(hass, url: str = USER_INPUT[CONF_GATEWAY_URL]) -> dict:
+    """Enter the address in the first step; returns the next step's result."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_USER}
     )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_GATEWAY_URL: url}
+    )
+
+
+async def test_user_flow_creates_entry(hass, mock_setup_entry):
+    """The address, then the login, then the data source creates the entry."""
+    result = await _start(hass)
+    assert result["step_id"] == "credentials"
+    assert result["description_placeholders"] == {"model": "UG65"}
 
     with patch(CONNECT, AsyncMock(return_value=True)):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], USER_INPUT
+            result["flow_id"], CREDENTIALS
         )
     # No device list to pick from: the step asks for the data source only.
     assert result["step_id"] == "devices"
@@ -121,20 +161,71 @@ async def test_user_flow_creates_entry(hass, mock_setup_entry):
     await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "https://192.0.2.10"
-    assert result["data"] == USER_INPUT
+    assert result["title"] == "Milesight UG65 (192.0.2.10)"
+    assert result["data"] == {**USER_INPUT, CONF_MODEL: "UG65"}
     # New entries default to the LoRaWAN source.
     assert result["options"] == {CONF_DATA_SOURCE: SOURCE_LORAWAN, CONF_DEVICES: []}
     assert result["result"].unique_id == "https://192.0.2.10:8080"
 
 
-async def _submit_credentials(hass) -> dict:
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
+async def test_the_hostname_names_the_entry(hass, mock_setup_entry, gateway_details):
+    """A hostname from the web interface tells the gateways of a fleet apart."""
+    gateway_details.return_value = GatewayDetails(
+        model_id=None, serial_number=None, hw_version=None, hostname="GW-8"
     )
+    result = await _start(hass)
+    with patch(CONNECT, AsyncMock(return_value=True)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+
+    assert result["title"] == "GW-8 - UG65 (192.0.2.10)"
+    assert result["data"] == {**USER_INPUT, CONF_MODEL: "UG65", CONF_HOSTNAME: "GW-8"}
+
+
+async def test_the_router_names_a_gateway_without_a_hostname(hass, mock_setup_entry):
+    """Without one from the gateway, the DHCP name a router reports is used."""
+    hass.states.async_set(
+        "device_tracker.router_gw",
+        "home",
+        {"ip": "192.0.2.10", "host_name": "ms_gw_mini.localdomain"},
+    )
+    result = await _start(hass)
+    with patch(CONNECT, AsyncMock(return_value=True)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+
+    assert result["title"] == "ms_gw_mini - UG65 (192.0.2.10)"
+    assert result["data"][CONF_HOSTNAME] == "ms_gw_mini"
+
+
+async def test_an_unreachable_address_asks_no_login(hass, gateway_info):
+    """When /islogin does not answer, the first step says so and stays."""
+    gateway_info.side_effect = APIConnectionError("down")
+
+    result = await _start(hass)
+
+    assert result["step_id"] == "user"
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_an_unknown_model_gets_the_full_form(hass, gateway_info):
+    """Without a model name every field is asked, as before the detection."""
+    gateway_info.return_value = GatewayInfo(model=None, firmware="1")
+
+    result = await _start(hass)
+
+    assert {str(key) for key in result["data_schema"].schema} == set(CREDENTIALS)
+
+
+async def _submit_credentials(hass) -> dict:
+    result = await _start(hass)
     with patch(CONNECT, AsyncMock(return_value=True)):
         return await hass.config_entries.flow.async_configure(
-            result["flow_id"], USER_INPUT
+            result["flow_id"], CREDENTIALS
         )
 
 
@@ -166,7 +257,7 @@ async def test_devices_are_chosen_before_the_entry_exists(
     await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["data"] == USER_INPUT
+    assert result["data"] == {**USER_INPUT, CONF_MODEL: "UG65"}
     assert result["options"] == {CONF_DATA_SOURCE: SOURCE_LORAWAN, CONF_DEVICES: stored}
 
 
@@ -206,38 +297,35 @@ async def test_user_flow_errors_then_recovers(
     hass, mock_setup_entry, side_effect, expected
 ):
     """Each failure shows its own error and the form still succeeds afterwards."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
-    )
+    result = await _start(hass)
 
-    with patch(CONNECT, AsyncMock(side_effect=side_effect)):
+    with (
+        patch(CONNECT, AsyncMock(side_effect=side_effect)),
+        patch(GET_DETAILS, AsyncMock(side_effect=APIAuthError("no web login"))),
+    ):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], USER_INPUT
+            result["flow_id"], CREDENTIALS
         )
 
     assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "credentials"
     assert result["errors"] == {"base": expected}
 
     with patch(CONNECT, AsyncMock(return_value=True)):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], USER_INPUT
+            result["flow_id"], CREDENTIALS
         )
     result = await _finish(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_user_flow_aborts_on_duplicate_address(hass, mock_setup_entry):
-    """The same gateway address cannot be added twice."""
+@pytest.mark.parametrize("typed", ["https://192.0.2.10", "http://192.0.2.10"])
+async def test_user_flow_aborts_on_duplicate_address(hass, mock_setup_entry, typed):
+    """The same gateway cannot be added twice, by either scheme; no login asked."""
     _entry().add_to_hass(hass)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
-    )
-    with patch(CONNECT, AsyncMock(return_value=True)):
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], USER_INPUT
-        )
+    result = await _start(hass, typed)
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
@@ -329,7 +417,10 @@ async def test_reconfigure_errors_then_recovers(
 
     result = await entry.start_reconfigure_flow(hass)
 
-    with patch(CONNECT, AsyncMock(side_effect=side_effect)):
+    with (
+        patch(CONNECT, AsyncMock(side_effect=side_effect)),
+        patch(GET_DETAILS, AsyncMock(side_effect=APIAuthError("no web login"))),
+    ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {**USER_INPUT, CONF_GATEWAY_URL: "https://192.0.2.11"},
@@ -404,6 +495,38 @@ async def test_options_flow_sets_scan_interval(hass):
     assert entry.options[CONF_SCAN_INTERVAL] == 120
 
 
+async def test_options_flow_sets_and_clears_the_device_topic(hass):
+    """A gateway-only entry gets a topic field; emptied, the topic is gone."""
+    entry = _entry(gateway_only=True)
+    entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.milesight_gateway.async_setup_entry", return_value=True
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        assert CONF_MQTT_TOPIC in {str(key) for key in result["data_schema"].schema}
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_MQTT_TOPIC: "a/{dev_eui}/#"}
+        )
+        assert result["errors"] == {CONF_MQTT_TOPIC: "invalid_topic"}
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_MQTT_TOPIC: "a/{dev_eui}"}
+        )
+        await hass.async_block_till_done()
+        assert entry.options[CONF_MQTT_TOPIC] == "a/{dev_eui}"
+
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {}
+        )
+        await hass.async_block_till_done()
+
+    assert entry.options[CONF_MQTT_TOPIC] == ""
+
+
 async def test_options_flow_sets_status_and_sources(hass):
     """The status interval, the outside sources and the data source can be set."""
     entry = _entry()
@@ -415,6 +538,8 @@ async def test_options_flow_sets_status_and_sources(hass):
         CONF_FIRMWARE_CHECK: False,
         CONF_DATA_SOURCE: SOURCE_LORAWAN,
         CONF_ALL_SETTINGS: True,
+        CONF_NETWORK_PANEL: False,
+        CONF_DEVICES_PANEL: False,
     }
 
     with patch(
@@ -425,10 +550,50 @@ async def test_options_flow_sets_status_and_sources(hass):
         result = await hass.config_entries.options.async_configure(
             result["flow_id"], options
         )
+        # A change of source asks first, saying what stays and what goes.
+        assert result["step_id"] == "confirm_source"
+        assert result["description_placeholders"] == {"old": "MQTT", "new": "LoRaWAN"}
+        assert entry.options == {}
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {}
+        )
         await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert dict(entry.options) == options
+
+
+async def test_the_same_source_needs_no_confirmation(hass):
+    """Saving without a change of source saves at once."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.milesight_gateway.async_setup_entry", return_value=True
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_DATA_SOURCE: SOURCE_MQTT}
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_a_gateway_only_entry_has_no_device_options(hass):
+    """No device list and no network server: no source, no settings, no choice."""
+    entry = _entry(gateway_only=True)
+    entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.milesight_gateway.async_setup_entry", return_value=True
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    fields = {str(key) for key in result["data_schema"].schema}
+    assert not fields & {CONF_DATA_SOURCE, CONF_ALL_SETTINGS, CONF_DEVICES}
+    assert CONF_MQTT_TOPIC in fields
 
 
 async def test_an_older_entry_keeps_its_behaviour(hass):
@@ -595,7 +760,10 @@ async def test_reauth_errors_then_recovers(
 
     result = await entry.start_reauth_flow(hass)
 
-    with patch(CONNECT, AsyncMock(side_effect=side_effect)):
+    with (
+        patch(CONNECT, AsyncMock(side_effect=side_effect)),
+        patch(GET_DETAILS, AsyncMock(side_effect=APIAuthError("no web login"))),
+    ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], creds
         )
@@ -624,12 +792,10 @@ async def test_reauth_errors_then_recovers(
 )
 async def test_user_flow_normalizes_the_url(hass, mock_setup_entry, typed):
     """A trailing slash breaks the client's URL building, so it is stripped."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
-    )
+    result = await _start(hass, typed)
     with patch(CONNECT, AsyncMock(return_value=True)):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
+            result["flow_id"], CREDENTIALS
         )
     result = await _finish(hass, result)
 
@@ -673,25 +839,21 @@ BAD_URLS = [
 
 @pytest.mark.parametrize(("typed", "expected"), BAD_URLS)
 async def test_user_flow_explains_an_unusable_url(
-    hass, mock_setup_entry, typed, expected
+    hass, mock_setup_entry, gateway_info, typed, expected
 ):
-    """An unusable URL is named at the field, without trying to connect."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
-    )
-    connect = AsyncMock(return_value=True)
-    with patch(CONNECT, connect):
-        result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
-        )
+    """An unusable URL is named at the field, without asking the gateway."""
+    result = await _start(hass, typed)
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {CONF_GATEWAY_URL: expected}
-    connect.assert_not_awaited()
+    gateway_info.assert_not_awaited()
 
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_GATEWAY_URL: USER_INPUT[CONF_GATEWAY_URL]}
+    )
     with patch(CONNECT, AsyncMock(return_value=True)):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], USER_INPUT
+            result["flow_id"], CREDENTIALS
         )
         result = await _finish(hass, result)
 
@@ -701,12 +863,10 @@ async def test_user_flow_explains_an_unusable_url(
 @pytest.mark.parametrize("typed", ["http://192.0.2.10", "https://gateway.local"])
 async def test_user_flow_accepts_http_and_host_names(hass, mock_setup_entry, typed):
     """Both schemes and host names are fine."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_USER}
-    )
+    result = await _start(hass, typed)
     with patch(CONNECT, AsyncMock(return_value=True)):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: typed}
+            result["flow_id"], CREDENTIALS
         )
         result = await _finish(hass, result)
 
@@ -733,3 +893,296 @@ async def test_reconfigure_explains_an_unusable_url(
     assert result["errors"] == {CONF_GATEWAY_URL: expected}
     connect.assert_not_awaited()
     assert entry.data[CONF_GATEWAY_URL] == "https://192.0.2.10"
+
+
+# --- gateway-only (UG63 Mini) and DHCP discovery ---------------------------
+
+from homeassistant.config_entries import SOURCE_DHCP, SOURCE_IGNORE  # noqa: E402
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo  # noqa: E402
+
+from custom_components.milesight_gateway.const import (  # noqa: E402
+    CONF_GATEWAY_ONLY,
+    CONF_MAC,
+)
+
+MAC = "24:e1:24:00:00:01"
+DISCOVERY = DhcpServiceInfo(
+    ip="192.0.2.10", hostname="milesight-gateway", macaddress="24e124000001"
+)
+WEB_LOGIN = {CONF_USERNAME: "admin", CONF_PASSWORD: "secret"}
+
+
+async def test_gateway_only_when_only_the_web_login_works(hass, mock_setup_entry):
+    """A gateway that takes the web login but not the network server one."""
+    result = await _start(hass)
+    with (
+        patch(CONNECT, AsyncMock(side_effect=APIAuthError("no ns login"))),
+        patch(GET_DETAILS, AsyncMock(return_value=DETAILS)),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+        await hass.async_block_till_done()
+
+    # No device step: the entry is created straight away, marked gateway-only.
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {**USER_INPUT, CONF_MODEL: "UG65", CONF_GATEWAY_ONLY: True}
+    assert result["options"] == {}
+
+
+async def test_a_wrong_password_stays_invalid_auth(hass, mock_setup_entry):
+    """When the web login is refused too, it is a bad login, not gateway-only."""
+    result = await _start(hass)
+    with (
+        patch(CONNECT, AsyncMock(side_effect=APIAuthError("bad"))),
+        patch(GET_DETAILS, AsyncMock(side_effect=APIAuthError("bad"))),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_a_ug63_is_asked_only_for_its_web_login(
+    hass, mock_setup_entry, gateway_info
+):
+    """The Mini gets user name and password, and no network server login."""
+    gateway_info.return_value = GatewayInfo(model="UG63", firmware="63.0.0.2-r2")
+
+    result = await _start(hass, "http://192.0.2.10")
+    # Its own step, whose text says that the devices are not shown.
+    assert result["step_id"] == "web_login"
+    assert {str(key) for key in result["data_schema"].schema} == {
+        *WEB_LOGIN,
+        CONF_MQTT_TOPIC,
+    }
+
+    connect = AsyncMock(return_value=True)
+    with (
+        patch(CONNECT, connect),
+        patch(GET_DETAILS, AsyncMock(return_value=DETAILS)),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], WEB_LOGIN
+        )
+        await hass.async_block_till_done()
+
+    connect.assert_not_called()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Milesight UG63 (192.0.2.10)"
+    assert result["data"][CONF_GATEWAY_ONLY] is True
+    assert result["data"][CONF_USERNAME] == "admin"
+    assert result["options"] == {}
+
+
+async def test_a_ug63_takes_the_topic_of_its_devices(
+    hass, mock_setup_entry, gateway_info
+):
+    """The topic goes into the options, where it can be changed later."""
+    gateway_info.return_value = GatewayInfo(model="UG63", firmware="63.0.0.2-r2")
+    result = await _start(hass, "http://192.0.2.10")
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**WEB_LOGIN, CONF_MQTT_TOPIC: " lora/{x}/{dev_eui} "}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert CONF_MQTT_TOPIC not in result["data"]
+    assert result["options"] == {CONF_MQTT_TOPIC: "lora/{x}/{dev_eui}"}
+
+
+async def test_a_wrong_topic_costs_no_login(hass, gateway_info, gateway_details):
+    """The topic is checked first: a failed login would count toward the lock."""
+    gateway_info.return_value = GatewayInfo(model="UG63", firmware="63.0.0.2-r2")
+    result = await _start(hass, "http://192.0.2.10")
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**WEB_LOGIN, CONF_MQTT_TOPIC: "lora/#"}
+    )
+
+    assert result["errors"] == {CONF_MQTT_TOPIC: "invalid_topic"}
+    gateway_details.assert_not_called()
+
+
+async def test_a_ug63_on_newer_firmware_gets_the_full_form(hass, gateway_info):
+    """The external-antenna UG63 runs 64.x; the firmware decides, not the name."""
+    gateway_info.return_value = GatewayInfo(model="UG63", firmware="64.0.0.5")
+
+    result = await _start(hass)
+
+    assert result["step_id"] == "credentials"
+    assert {str(key) for key in result["data_schema"].schema} == set(CREDENTIALS)
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "expected"),
+    [
+        (APIAuthError("bad"), "invalid_auth"),
+        (APIConnectionError("down"), "cannot_connect"),
+    ],
+)
+async def test_a_ug63_login_error_never_tries_the_network_server(
+    hass, gateway_info, side_effect, expected
+):
+    """A refused web login is the answer; the network server is not asked."""
+    gateway_info.return_value = GatewayInfo(model="UG63", firmware="63.0.0.2-r2")
+    result = await _start(hass)
+
+    connect = AsyncMock(return_value=True)
+    with (
+        patch(CONNECT, connect),
+        patch(GET_DETAILS, AsyncMock(side_effect=side_effect)),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], WEB_LOGIN
+        )
+
+    connect.assert_not_called()
+    assert result["errors"] == {"base": expected}
+
+
+async def test_a_gateway_only_reauth_asks_for_the_web_login(hass, mock_setup_entry):
+    """Reauth of a Mini neither shows the AES fields nor logs in to its NS."""
+    entry = _entry(gateway_only=True)
+    entry.add_to_hass(hass)
+
+    result = await entry.start_reauth_flow(hass)
+    assert {str(key) for key in result["data_schema"].schema} == set(WEB_LOGIN)
+
+    connect = AsyncMock(return_value=True)
+    with (
+        patch(CONNECT, connect),
+        patch(GET_DETAILS, AsyncMock(return_value=DETAILS)),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**WEB_LOGIN, CONF_PASSWORD: "rotated"}
+        )
+        await hass.async_block_till_done()
+
+    connect.assert_not_called()
+    assert result["reason"] == "reauth_successful"
+    assert entry.data[CONF_PASSWORD] == "rotated"
+
+
+async def test_dhcp_discovery_confirms_then_asks_for_the_login(hass, mock_setup_entry):
+    """A new gateway is confirmed with its model, then set up under its MAC."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DISCOVERY
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "discovery_confirm"
+    assert result["description_placeholders"] == {
+        "model": "UG65",
+        "host": "192.0.2.10",
+    }
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["step_id"] == "credentials"
+
+    with patch(CONNECT, AsyncMock(return_value=True)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+    result = await _finish(hass, result)
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_GATEWAY_URL] == "http://192.0.2.10"
+    assert result["data"][CONF_MAC] == MAC
+    assert result["result"].unique_id == MAC
+
+
+async def test_dhcp_discovery_moves_a_known_gateway_to_its_new_address(hass):
+    """A gateway known by its MAC takes the new IP and keeps its scheme."""
+    entry = _entry(mac=MAC)
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, unique_id=MAC)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            ip="192.0.2.99", hostname="gateway", macaddress="24e124000001"
+        ),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert entry.data[CONF_GATEWAY_URL] == "https://192.0.2.99"
+
+
+async def test_dhcp_discovery_gives_a_hand_added_gateway_its_mac(hass):
+    """An entry found at the discovered address takes the MAC as unique id."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DISCOVERY
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert entry.unique_id == MAC
+    assert entry.data[CONF_MAC] == MAC
+    assert entry.data[CONF_GATEWAY_URL] == "https://192.0.2.10"
+
+
+async def test_dhcp_discovery_brings_the_hostname_and_the_title_follows(hass):
+    """The DHCP name names an entry that had none, if its title is still the setup's."""
+    entry = _entry(**{CONF_MODEL: "UG63"})
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, title="Milesight UG63 (192.0.2.10)")
+
+    await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DISCOVERY
+    )
+
+    assert entry.data[CONF_HOSTNAME] == "milesight-gateway"
+    assert entry.title == "milesight-gateway - UG63 (192.0.2.10)"
+
+
+async def test_dhcp_discovery_respects_an_ignored_gateway(hass, gateway_info):
+    """A discovery the user ignored is not offered again."""
+    MockConfigEntry(domain=DOMAIN, source=SOURCE_IGNORE, unique_id=MAC).add_to_hass(
+        hass
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DISCOVERY
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    gateway_info.assert_not_awaited()
+
+
+async def test_dhcp_discovery_aborts_when_the_gateway_does_not_answer(
+    hass, gateway_info
+):
+    """A device that does not answer /islogin is not offered."""
+    gateway_info.side_effect = APIConnectionError("down")
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_DHCP}, data=DISCOVERY
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cannot_connect"
+
+
+async def test_reconfigure_keeps_a_mac_unique_id(hass, mock_setup_entry):
+    """A MAC unique id does not fall back to the address on reconfigure."""
+    entry = _entry(mac=MAC)
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(entry, unique_id=MAC)
+
+    result = await entry.start_reconfigure_flow(hass)
+    with patch(CONNECT, AsyncMock(return_value=True)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**USER_INPUT, CONF_GATEWAY_URL: "https://192.0.2.11"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.unique_id == MAC

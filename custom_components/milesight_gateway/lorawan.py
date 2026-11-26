@@ -62,6 +62,10 @@ def _client(data: dict[str, Any]) -> MilesightGatewayClient:
 class LoRaWANRuntime:
     """One gateway entry's connection, device models and coordinators."""
 
+    sends_downlinks = True
+    # How values come and settings go, for the device page.
+    path = "rest"
+
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Prepare; async_start() connects."""
         self.hass = hass
@@ -129,8 +133,15 @@ class LoRaWANRuntime:
 
     @callback
     def _disconnected(self) -> None:
-        if not self.hass.is_stopping:
-            self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
+        if self.hass.is_stopping:
+            return
+        runtime = self.entry.runtime_data
+        if runtime.installing:
+            # A reload now would end the installation's wait for the new
+            # version; it follows once the installation is over.
+            runtime.reload_after_install = True
+            return
+        self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
     @callback
     def _added(self, device: MilesightDevice) -> None:

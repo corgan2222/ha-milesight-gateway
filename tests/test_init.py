@@ -108,3 +108,22 @@ async def test_migration_is_a_noop_when_already_current(hass):
     assert await async_migrate_entry(hass, entry)
     assert registry.async_get(stale.id).identifiers == {(DOMAIN, LEGACY_ID)}
     assert entry.minor_version == ENTRY_MINOR_VERSION
+
+
+async def test_migration_marks_the_entry_for_its_region_readings(hass):
+    """The entities look at the mark as they load; see the device tests."""
+    from custom_components.milesight_gateway.lorawan_entity import (
+        RETIRE_EMPTY_OPTIONAL,
+    )
+
+    entry = _entry(minor_version=2)
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry)
+    assert hass.data[RETIRE_EMPTY_OPTIONAL] == {entry.entry_id}
+    assert entry.minor_version == ENTRY_MINOR_VERSION
+
+    # Once: the next start finds a current entry and marks nothing.
+    hass.data.pop(RETIRE_EMPTY_OPTIONAL)
+    assert await async_migrate_entry(hass, entry)
+    assert RETIRE_EMPTY_OPTIONAL not in hass.data

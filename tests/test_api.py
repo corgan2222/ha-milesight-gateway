@@ -9,6 +9,7 @@ has merely expired.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,9 +21,7 @@ from custom_components.milesight_gateway.api import (
     APIAuthError,
     APIConnectionError,
     MilesightGatewayAPI,
-    _build_device,
-    _get_device_details,
-    _load_devices_db,
+    _seen_at,
 )
 
 
@@ -52,7 +51,6 @@ def _api(client: MagicMock) -> MilesightGatewayAPI:
             password="secret",  # noqa: S106
             secret_key="1111111111111111",  # noqa: S106
             iv="2222222222222222",
-            mqtt_base_topic="sensors/lora/uplink",
         )
 
 
@@ -142,7 +140,7 @@ async def test_device_fetch_translates_client_errors(raised, expected):
 
 async def test_expired_token_is_retried_behind_a_fresh_login():
     """A 401 while fetching means the token expired, not a wrong password."""
-    devices = [{"devEUI": "24e124725e123456", "active": True}]
+    devices = [{"devEUI": "24e124538b223213", "active": True}]
     client = _ok_client()
     api = _api(client)
     await api.async_connect(MagicMock())
@@ -237,10 +235,10 @@ async def test_null_fields_in_the_device_list_are_tolerated():
         [
             "not a device",
             {"devEUI": 12345, "active": True},
-            # The AM307 family shares this EUI prefix, so the payload name is
-            # consulted; null must not break the whole device list.
+            # Null must not break the whole device list; the devEUI prefix
+            # stands in for the codec name.
             {
-                "devEUI": "24E124707E111005",
+                "devEUI": "24E124538B223213",
                 "active": True,
                 "name": None,
                 "payloadName": None,
@@ -253,55 +251,106 @@ async def test_null_fields_in_the_device_list_are_tolerated():
     devices, online, offline = await api.async_get_devices(MagicMock())
 
     assert [(device.dev_eui, device.name) for device in devices] == [
-        ("24E124707E111005", "Unknown Device")
+        ("24E124538B223213", "24E124538B223213")
     ]
     assert (online, offline) == (2, 0)
 
 
-# --- device database -------------------------------------------------------
+async def test_a_device_that_stopped_reporting_is_listed_as_offline():
+    """ "active" stays true for it; the network server's status 3 tells."""
+    client = _ok_client(
+        [
+            {"devEUI": "24E124538B223213", "active": True, "status": 2},
+            {"devEUI": "24E124538B223214", "active": True, "status": 3},
+            {"devEUI": "24E124538B223215", "active": False, "status": 3},
+        ]
+    )
 
+    devices, online, offline = await _api(client).async_get_devices(MagicMock())
 
-def test_an_unreadable_device_database_yields_no_models(tmp_path):
-    """A missing or broken database is logged and treated as empty."""
-    with patch(
-        "custom_components.milesight_gateway.api._DEVICES_DB_PATH",
-        tmp_path / "missing.json",
-    ):
-        assert _load_devices_db() == {"devices": []}
-
-
-DB = {
-    "devices": [
-        {"deveui": "24e124128", "name": "EM300-TH", "device_entities": ["a"]},
-        {"deveui": "24e124128", "name": "EM300-MCS", "device_entities": ["b"]},
-        {"deveui": "24e124999", "name": "WT101", "device_entities": ["c"]},
-        {"deveui": "24e124777", "name": "no entities"},
+    assert [(d.dev_eui[-2:], d.online) for d in devices] == [
+        ("13", True),
+        ("14", False),
     ]
-}
+    assert (online, offline) == (1, 2)
+
+
+# --- catalog models and downlinks -----------------------------------------
+
+
+async def test_the_payload_codec_names_the_model():
+    """The codec name decides, suffixes of custom codecs aside."""
+    client = _ok_client(
+        [
+            {
+                "devEUI": "24E124707E111005",
+                "active": True,
+                "name": "office",
+                "payloadName": "AM307L_esec",
+            }
+        ]
+    )
+
+    devices, _, _ = await _api(client).async_get_devices(MagicMock())
+
+    assert [(d.model_id, d.model, d.name) for d in devices] == [
+        ("am307l", devices[0].model, "office")
+    ]
+    assert devices[0].model
+
+
+async def test_downlinks_go_out_as_encoded_bytes():
+    """Base64 on the queue; a reference makes it confirmed, so the ACK can follow."""
+    api = _api(_ok_client())
+    call = AsyncMock(return_value={})
+    with patch.object(api, "async_ns_call", call):
+        await api.async_enqueue_downlink(
+            MagicMock(), "24E124538B223213", bytes([0xFF, 0x10]), reference="ha-7"
+        )
+        await api.async_enqueue_downlink(
+            MagicMock(), "24E124538B223213", bytes([0xFF, 0x10])
+        )
+
+    (_, method, path, body), (*_, plain) = (c.args for c in call.await_args_list)
+    assert (method, path) == ("POST", "/api/devices/24E124538B223213/queue")
+    assert body == {
+        "confirmed": True,
+        "devEUI": "24E124538B223213",
+        "fPort": 85,
+        "data": "/xA=",
+        "reference": "ha-7",
+    }
+    assert plain["confirmed"] is False
+    assert "reference" not in plain
+
+
+async def test_an_expired_login_is_renewed_for_a_call():
+    """One 401 renews the login, then the call goes through."""
+    client = _ok_client()
+    api = _api(client)
+    seen = AsyncMock(side_effect=[APIAuthError("401"), {"ok": 1}])
+    with patch.object(api, "_async_ns_call", seen):
+        assert await api.async_ns_call(MagicMock(), "GET", "/api/x") == {"ok": 1}
+    assert client.get_jwt_token.await_count == 1
 
 
 @pytest.mark.parametrize(
-    ("eui", "payload_name", "expected"),
+    ("value", "expected"),
     [
-        ("24E1249990000001", "", "WT101"),
-        ("24e1241280000001", "em300-mcs", "EM300-MCS"),
-        ("24e1241280000001", "EM300-MCS_new", "EM300-MCS"),
-        ("24e1241280000001", "unknown", "EM300-TH"),
-        ("24e1247770000001", "", None),
-        ("0000000000000001", "", None),
+        (
+            "2026-11-27 04:01:15.51938 +0800 CST",
+            datetime(2026, 11, 26, 20, 1, 15, 519380, tzinfo=UTC),
+        ),
+        (
+            "2026-11-27 04:01:15 +0800 CST",
+            datetime(2026, 11, 26, 20, 1, 15, tzinfo=UTC),
+        ),
+        ("-", None),
+        ("", None),
+        (None, None),
+        (1795721123, None),
     ],
 )
-def test_device_model_lookup(eui, payload_name, expected):
-    """The EUI prefix picks the model; the payload name settles shared prefixes."""
-    details = _get_device_details(eui, DB, payload_name)
-    assert (details or {}).get("name") == expected
-
-
-def test_duplicate_and_unknown_keys_are_skipped():
-    """Each mapped key gives its entities once; unmapped keys give none."""
-    device = _build_device(
-        {"devEUI": "24e1241280000001", "name": "probe"},
-        {"device_entities": ["temperature", "temperature", "not_a_key"]},
-        "base",
-    )
-    assert [entity.key for entity in device.entities] == ["temperature"]
+def test_the_network_server_time_is_read_with_its_offset(value, expected):
+    """The gateway writes its own clock's zone; the moment must still be exact."""
+    assert _seen_at(value) == expected

@@ -3,7 +3,8 @@
         "abort": {
             "already_configured": "Device is already configured",
             "reconfigure_successful": "Re-configuration was successful",
-            "reauth_successful": "Re-authentication was successful"
+            "reauth_successful": "Re-authentication was successful",
+            "cannot_connect": "The gateway does not answer at this address."
         },
         "error": {
             "missing_scheme": "Start the URL with http:// or https://, for example https://192.0.2.10.",
@@ -11,7 +12,8 @@
             "invalid_url": "Enter only the gateway's address, for example https://192.0.2.10, without a path or user name.",
             "cannot_connect": "Failed to connect",
             "invalid_auth": "Invalid authentication",
-            "unknown": "Unexpected error"
+            "unknown": "Unexpected error",
+            "invalid_topic": "The topic needs whole levels: {dev_eui} at most once, + or another placeholder only as a full level, no #."
         },
         "step": {
             "devices": {
@@ -20,7 +22,7 @@
                     "devices": "Devices"
                 },
                 "data_description": {
-                    "data_source": "Where sensor values come from. LoRaWAN reads the gateway's packet log and decodes with Milesight's own codecs; no MQTT broker needed. MQTT takes what the gateway publishes, decoded by the codecs set up on the gateway.",
+                    "data_source": "Where the devices' sensor values come from.",
                     "devices": "Searchable by name, model and devEUI. You can change the choice later in the options."
                 },
                 "description": "The gateway lists {count} devices with a known model. Pick the ones that should get entities in Home Assistant, or leave the list empty for all of them.",
@@ -65,8 +67,19 @@
                 "title": "Reconfigure Milesight Gateway"
             },
             "user": {
+                "title": "Add a Milesight gateway",
+                "description": "Enter the gateway's address. The next step asks for the login this model needs.",
                 "data": {
-                    "gateway_url": "Gateway URL",
+                    "gateway_url": "Gateway URL"
+                },
+                "data_description": {
+                    "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.0.2.10`."
+                }
+            },
+            "credentials": {
+                "title": "Log in to the {model}",
+                "description": "Enter the login for your Milesight {model}.",
+                "data": {
                     "port": "Port",
                     "username": "Username",
                     "password": "Password",
@@ -75,18 +88,34 @@
                     "gateway_mqtt_base_topic": "MQTT uplink base topic"
                 },
                 "data_description": {
-                    "gateway_url": "The URL of your Milesight gateway with http:// or https:// but without the port, for example `https://192.0.2.10`.",
                     "port": "The port of the gateway API.",
                     "username": "The username to log in to the Milesight gateway.",
                     "password": "The password to log in to the Milesight gateway.",
                     "secret_key": "The 16-character AES encryption key for the gateway password.",
                     "iv": "The 16-character AES initialization vector for the gateway password.",
                     "gateway_mqtt_base_topic": "The MQTT topic prefix for sensor uplink messages, for example `sensors/lora/uplink`."
+                }
+            },
+            "web_login": {
+                "title": "Log in to the {model}",
+                "description": "The {model} has no network server login that Home Assistant can use. The gateway itself is shown: online state, firmware and system values. Its devices appear when it publishes their uplinks by MQTT: give each application on the gateway an MQTT topic with $deveui in it, and enter the same topic here with {dev_eui} in its place.",
+                "data": {
+                    "username": "Username",
+                    "password": "Password",
+                    "mqtt_topic": "MQTT topic of the devices"
                 },
-                "description": "Enter the connection details for your Milesight gateway.",
-                "title": "Configure Milesight Gateway"
+                "data_description": {
+                    "username": "The username to log in to the Milesight gateway.",
+                    "password": "The password to log in to the Milesight gateway.",
+                    "mqtt_topic": "For example sensors/lora/uplink/{dev_eui}. {dev_eui} marks where the devEUI sits; any other placeholder in curly braces, or +, matches anything. Leave empty to show the gateway only."
+                }
+            },
+            "discovery_confirm": {
+                "title": "Milesight gateway found",
+                "description": "Set up the Milesight {model} at {host}?"
             }
-        }
+        },
+        "flow_title": "{model} ({host})"
     },
     "entity": {
         "sensor": {
@@ -95,12 +124,59 @@
             },
             "temperature": {
                 "name": "Temperature"
+            },
+            "fleet_role": {
+                "name": "Fleet role",
+                "state": {
+                    "master": "Master (network server)",
+                    "node": "Node (packet forwarder)",
+                    "standalone": "Standalone"
+                }
+            },
+            "command_status": {
+                "name": "Command status",
+                "state": {
+                    "pending": "Pending",
+                    "retrying": "Retrying",
+                    "transmitted": "Delivered, waiting for ACK",
+                    "acknowledged": "Acknowledged",
+                    "confirmed": "Confirmed",
+                    "differs": "Reported differently",
+                    "sent": "Sent",
+                    "failed": "Failed"
+                }
+            },
+            "signal_quality": {
+                "name": "Signal quality",
+                "state": {
+                    "excellent": "Excellent",
+                    "good": "Good",
+                    "fair": "Fair",
+                    "poor": "Poor"
+                }
+            },
+            "packet_loss": {
+                "name": "Packet loss today"
+            },
+            "gateways_in_range": {
+                "name": "Gateways in range"
+            },
+            "battery_days_left": {
+                "name": "Battery days left"
+            }
+        },
+        "button": {
+            "sync_devices": {
+                "name": "Sync devices"
             }
         }
     },
     "exceptions": {
         "downlink_failed": {
             "message": "The gateway did not accept the command for the device: {error}"
+        },
+        "sync_failed": {
+            "message": "Cannot read the gateway's device list: {error}"
         }
     },
     "options": {
@@ -109,30 +185,56 @@
                 "data": {
                     "scan_interval": "Polling interval (seconds)",
                     "status_interval": "Status interval (seconds)",
-                    "web_data": "Read the web interface",
+                    "web_data": "Read the gateway's details",
                     "firmware_check": "Check for new firmware",
                     "devices": "Devices",
                     "data_source": "Data source",
-                    "all_settings": "Entities for all device settings"
+                    "all_settings": "All device settings as entities",
+                    "mqtt_topic": "MQTT topic of the devices",
+                    "network_panel": "Show the network map in the sidebar",
+                    "devices_panel": "Show the device page in the sidebar",
+                    "mqtt_downlink_topic": "MQTT downlink topic",
+                    "mqtt_ack_topic": "MQTT ACK topic",
+                    "mqtt_error_topic": "MQTT error topic",
+                    "mqtt_join_topic": "MQTT join topic",
+                    "mqtt_request_topic": "MQTT request topic",
+                    "mqtt_response_topic": "MQTT response topic"
                 },
                 "data_description": {
-                    "scan_interval": "How often to read the device list from the gateway. Sensor values arrive by MQTT as soon as they are sent.",
+                    "scan_interval": "How often the gateway is read: its device list, or for a gateway without one, whether it answers.",
                     "status_interval": "How often to read the gateway's status: links, packets, CPU and memory.",
-                    "web_data": "Log in to the gateway's web interface for its serial number, CPU load, memory, storage and uptime. Uses the same account.",
+                    "web_data": "Serial number, CPU load, memory, storage and uptime, read from the gateway's web interface with the same account.",
                     "firmware_check": "Look up the newest gateway firmware on milesight.com twice a day.",
                     "devices": "Only these devices get entities. Leave empty for all devices. Devices you remove from the list are removed from Home Assistant with their entities.",
-                    "data_source": "Where sensor values come from. LoRaWAN reads the gateway's packet log and decodes with Milesight's own codecs; no MQTT broker needed. MQTT takes what the gateway publishes, decoded by the codecs set up on the gateway.",
-                    "all_settings": "LoRaWAN source only. Off: report interval, target temperature, reboot and status report. On: about 25 more per device, disabled until you enable them."
+                    "data_source": "Where the devices' sensor values come from.",
+                    "all_settings": "Every device always gets report interval, target temperature (thermostats), reboot and status request. Switched on, each device also gets an entity for every other setting its codec knows, about 25: alarms, thresholds, calibration. They start disabled; enable the ones you need.",
+                    "mqtt_topic": "For example sensors/lora/uplink/{dev_eui}. {dev_eui} marks where the devEUI sits; any other placeholder in curly braces, or +, matches anything. Leave empty to show the gateway only.",
+                    "network_panel": "LoRaWAN only. One menu entry serves all gateways; switched off at any of them, it leaves the sidebar. The page keeps its address and the dashboard card still works.",
+                    "devices_panel": "One menu entry serves all gateways; switched off at any of them, it leaves the sidebar. The page keeps its address, /milesight-devices.",
+                    "mqtt_downlink_topic": "The topic the gateway's application takes downlinks from, for example sensors/lora/downlink/{dev_eui}. Leave empty for no device settings.",
+                    "mqtt_ack_topic": "The topic the application reports ACKs of confirmed downlinks to, for example sensors/lora/ack/{dev_eui}. With it, a downlink without an ACK is sent again.",
+                    "mqtt_error_topic": "Where the application reports failed downlinks, for example sensors/lora/error/{dev_eui}.",
+                    "mqtt_join_topic": "Where the application reports joins, for example sensors/lora/join/{dev_eui}.",
+                    "mqtt_request_topic": "Where the network server takes API requests, exactly as set on the gateway, $deveui included. With the response topic, the device list comes from the gateway.",
+                    "mqtt_response_topic": "Where the network server answers API requests, exactly as set on the gateway."
                 },
-                "title": "Milesight Gateway options"
+                "title": "Milesight LoRaWAN Gateway options"
+            },
+            "confirm_source": {
+                "title": "Switch from {old} to {new}?",
+                "description": "Values both sources report keep their entities, entity IDs and history. Entities only {old} provides are removed; the settings and buttons of the devices differ between the two sources. Values only {new} provides appear as the devices report. The integration reloads."
             }
+        },
+        "error": {
+            "invalid_topic": "The topic needs whole levels: {dev_eui} at most once, + or another placeholder only as a full level, no #.",
+            "invalid_downlink_topic": "A downlink or ACK topic names one device: {dev_eui} exactly once, no + or #, no other placeholder."
         }
     },
     "selector": {
         "data_source": {
             "options": {
-                "lorawan": "LoRaWAN (packet log)",
-                "mqtt": "MQTT"
+                "lorawan": "LoRaWAN: reads the gateway's packet log and decodes with Milesight's own codecs. Needs no MQTT broker. Settings go to the devices through the gateway's network server, for every model Milesight publishes a codec for.",
+                "mqtt": "MQTT: takes what the gateway publishes, decoded by the payload codecs set up on the gateway. Needs an MQTT broker in Home Assistant. Settings go to the devices on the MQTT downlink topic of the gateway's application, and their ACK comes back on its ACK topic."
             }
         }
     }

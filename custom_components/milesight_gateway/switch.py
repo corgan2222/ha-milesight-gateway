@@ -1,227 +1,207 @@
-"""
-Switch entities for on/off device settings, sent as downlinks.
-
-The payload path names where the value sits in uplink reports; the downlink
-command nests the same path, because the codecs use one vocabulary for both.
-A device reports its settings in a status report, so the state stays unknown
-until the first one arrives.
-"""
+"""Two-state device settings as downlinks; Wi-Fi and WireGuard of fleet gateways."""
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.components.switch import SwitchEntity
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import lorawan_platforms
-from .const import CONF_GATEWAY_URL, SOURCE_LORAWAN, data_source
-from .entity import MilesightDeviceEntity, nested_command
+from .const import gateway_only
+from .coordinator import MilesightDiagnosticsCoordinator
+from .entity import fleet_device_info, on_first_status
 
 if TYPE_CHECKING:
-    from homeassistant.components.mqtt.models import ReceiveMessage
+    from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import MilesightGatewayConfigEntry
-    from .api import MilesightDevice
-    from .coordinator import MilesightGatewayCoordinator
-
-_LOGGER = logging.getLogger(__name__)
+    from .api import FleetGateway
+    from .fleet import MemberStatus, WireGuardInterface
 
 PARALLEL_UPDATES = 0
 
 
-@dataclass(frozen=True, kw_only=True)
-class MilesightSwitchDescription(SwitchEntityDescription):
-    """
-    An on/off setting with its place in the payload.
-
-    Some encoders take a whole object at once, like open_window_detection
-    with enable, threshold and time. ``defaults`` fills the sibling fields
-    until the device has reported them.
-    """
-
-    path: tuple[str, ...]
-    defaults: dict[str, Any] = field(default_factory=dict)
-
-
-_CHILD_LOCK = MilesightSwitchDescription(
-    key="child_lock",
-    name="Child lock",
-    icon="mdi:lock-outline",
-    path=("child_lock_config", "enable"),
-    entity_category=EntityCategory.CONFIG,
-)
-_BUZZER = MilesightSwitchDescription(
-    key="buzzer_enable",
-    name="Buzzer",
-    icon="mdi:volume-high",
-    path=("buzzer_enable",),
-    entity_category=EntityCategory.CONFIG,
-)
-_LED_ENABLE = MilesightSwitchDescription(
-    key="led_indicator_enable",
-    name="LED indicator",
-    icon="mdi:led-on",
-    path=("led_indicator_enable",),
-    entity_category=EntityCategory.CONFIG,
-)
-_OWD_ENABLE = MilesightSwitchDescription(
-    key="open_window_detection",
-    name="Open window detection",
-    icon="mdi:window-open-variant",
-    path=("open_window_detection", "enable"),
-    defaults={"temperature_threshold": 5, "time": 10},
-    entity_category=EntityCategory.CONFIG,
-)
-_FREEZE_PROTECTION = MilesightSwitchDescription(
-    key="freeze_protection",
-    name="Freeze protection",
-    icon="mdi:snowflake-alert",
-    path=("freeze_protection_config", "enable"),
-    defaults={"temperature": 5},
-    entity_category=EntityCategory.CONFIG,
-)
-_DISPLAY_AMBIENT = MilesightSwitchDescription(
-    key="display_ambient_temperature",
-    name="Display ambient temperature",
-    icon="mdi:sun-thermometer-outline",
-    path=("display_ambient_temperature",),
-    entity_category=EntityCategory.CONFIG,
-)
-_CHANGE_REPORT = MilesightSwitchDescription(
-    key="change_report_enable",
-    name="Report on change",
-    icon="mdi:swap-vertical-bold",
-    path=("change_report_enable",),
-    entity_category=EntityCategory.CONFIG,
-)
-_OTC_ENABLE = MilesightSwitchDescription(
-    key="outside_temperature_control",
-    name="Outside temperature control",
-    icon="mdi:home-thermometer-outline",
-    path=("outside_temperature_control", "enable"),
-    defaults={"timeout": 30},
-    entity_category=EntityCategory.CONFIG,
-)
-_CALIBRATION_ENABLE = MilesightSwitchDescription(
-    key="temperature_calibration",
-    name="Temperature calibration",
-    icon="mdi:thermometer-check",
-    path=("temperature_calibration_settings", "enable"),
-    defaults={"calibration_value": 0},
-    entity_category=EntityCategory.CONFIG,
-)
-
-DEVICE_SWITCHES: dict[str, tuple[MilesightSwitchDescription, ...]] = {
-    "am307": (_BUZZER,),
-    "am307l": (_BUZZER,),
-    "am308": (_BUZZER,),
-    "am308l": (_BUZZER,),
-    "vs340": (_LED_ENABLE,),
-    "vs341": (_LED_ENABLE,),
-    "ws203": (_LED_ENABLE,),
-    "wt101": (
-        _CHILD_LOCK,
-        _OWD_ENABLE,
-        _FREEZE_PROTECTION,
-        _DISPLAY_AMBIENT,
-        _CHANGE_REPORT,
-        _OTC_ENABLE,
-        _CALIBRATION_ENABLE,
-    ),
-}
-
-
 async def async_setup_entry(
-    _hass: HomeAssistant,
+    hass: HomeAssistant,
     config_entry: MilesightGatewayConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create switch entities for every known setting of each device."""
-    if data_source(config_entry.options) == SOURCE_LORAWAN:
-        await lorawan_platforms.async_setup_switches(
-            _hass, config_entry, async_add_entities
-        )
+    """Add the two-state settings of each device, and the gateways' switches."""
+    await lorawan_platforms.async_setup_switches(hass, config_entry, async_add_entities)
+    if gateway_only(config_entry.data):
         return
-    coordinator = config_entry.runtime_data.coordinator
-    gateway_url = config_entry.data[CONF_GATEWAY_URL]
+    diagnostics = config_entry.runtime_data.diagnostics
+    entry_id = config_entry.entry_id
     gateway_id = config_entry.runtime_data.gateway_device_id
-
-    async_add_entities(
-        MilesightSettingSwitch(
-            coordinator, device, description, gateway_url, gateway_id
-        )
-        for device in coordinator.data.devices
-        for description in DEVICE_SWITCHES.get(device.model_id, ())
+    # The gateways are only known once the status was read.
+    on_first_status(
+        config_entry,
+        diagnostics,
+        lambda data: [
+            switch
+            for gateway in data.network.gateways
+            if (member := data.members.get(gateway.eui)) is not None
+            for switch in (
+                *(
+                    [
+                        MilesightFleetWifiSwitch(
+                            diagnostics, gateway, entry_id, gateway_id
+                        )
+                    ]
+                    if member.wifi_enabled is not None
+                    else []
+                ),
+                *(
+                    MilesightFleetWireGuardSwitch(
+                        diagnostics, gateway, entry_id, gateway_id, interface
+                    )
+                    for interface in member.wireguard
+                ),
+            )
+        ],
+        async_add_entities,
     )
 
 
-class MilesightSettingSwitch(MilesightDeviceEntity, SwitchEntity):
-    """One on/off device setting, written as a downlink."""
+class _MemberSwitch(CoordinatorEntity[MilesightDiagnosticsCoordinator], SwitchEntity):
+    """A setting of a gateway, switched through its own web interface."""
 
-    entity_description: MilesightSwitchDescription
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
         self,
-        coordinator: MilesightGatewayCoordinator,
-        device: MilesightDevice,
-        description: MilesightSwitchDescription,
-        configuration_url: str,
+        coordinator: MilesightDiagnosticsCoordinator,
+        gateway: FleetGateway,
+        entry_id: str,
+        gateway_id: str,
+        key: str,
+    ) -> None:
+        """Attach the switch to the gateway's device."""
+        super().__init__(coordinator)
+        self._eui = gateway.eui
+        self._attr_unique_id = f"{entry_id}_{gateway.eui}_{key}"
+        data = coordinator.data
+        # The entry's own gateway carries its switches on the gateway device.
+        local = data is not None and gateway.eui == data.network.gateway_eui
+        self._attr_device_info = fleet_device_info(
+            gateway, entry_id, gateway_id, local=local
+        )
+
+    @property
+    def _member(self) -> MemberStatus | None:
+        data = self.coordinator.data
+        return data.members.get(self._eui) if data else None
+
+    @property
+    def available(self) -> bool:
+        """Unavailable while the member does not answer."""
+        return super().available and self._member is not None
+
+    async def _async_switch(self, *, on: bool) -> None:
+        raise NotImplementedError
+
+    async def async_turn_on(self, **kwargs: Any) -> None:  # noqa: ARG002
+        """Switch it on at the gateway, then read its state again."""
+        await self._async_switch(on=True)
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:  # noqa: ARG002
+        """Switch it off at the gateway, then read its state again."""
+        await self._async_switch(on=False)
+        await self.coordinator.async_request_refresh()
+
+
+class MilesightFleetWifiSwitch(_MemberSwitch):
+    """The Wi-Fi of a fleet member: its access point, unless it is a client."""
+
+    _attr_name = "Wi-Fi"
+    _attr_icon = "mdi:wifi"
+
+    def __init__(
+        self,
+        coordinator: MilesightDiagnosticsCoordinator,
+        gateway: FleetGateway,
+        entry_id: str,
         gateway_id: str,
     ) -> None:
-        """Initialize the switch."""
-        super().__init__(coordinator, device, configuration_url, gateway_id)
-        self.entity_description = description
-        self._attr_unique_id = f"{device.dev_eui}_{description.key}"
-        # Sibling fields of the setting's object, as last reported.
-        self._known: dict[str, Any] = {}
+        """Key it by the gateway."""
+        super().__init__(coordinator, gateway, entry_id, gateway_id, "wifi")
 
-    @callback
-    def _handle_mqtt_message(self, msg: ReceiveMessage) -> None:
-        """Take the reported value over, when a status report carries it."""
-        path = self.entity_description.path
-        if len(path) > 1:
-            parent = self._read_path(msg, path[:-1])
-            if isinstance(parent, dict):
-                self._known.update(parent)
-        value = self._read_path(msg, path)
-        if value is None:
-            return
-        try:
-            self._attr_is_on = int(value) == 1
-        except TypeError, ValueError:
-            _LOGGER.debug(
-                "Unreadable setting %s on topic %s: %r",
-                self.entity_description.key,
-                self._data_topic,
-                value,
-            )
-            return
-        self.async_write_ha_state()
+    @property
+    def is_on(self) -> bool | None:
+        """Return whether the Wi-Fi is on."""
+        member = self._member
+        return member.wifi_enabled if member else None
 
-    async def _async_send(self, value: int) -> None:
-        path = self.entity_description.path
-        if len(path) == 1:
-            command = nested_command(path, value)
-        else:
-            # The encoder wants the whole object; fill what the device has
-            # not reported yet from the defaults.
-            fields = {**self.entity_description.defaults, **self._known}
-            fields[path[-1]] = value
-            command = nested_command(path[:-1], fields)
-        await self._async_send_downlink(command)
-        self._known[path[-1]] = value
-        self._attr_is_on = value == 1
-        self.async_write_ha_state()
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Name the network and whether the gateway opens it or joins it."""
+        member = self._member
+        if member is None:
+            return None
+        mode = member.wifi_access_point
+        return {
+            "ssid": member.wifi_ssid,
+            "mode": None if mode is None else "access_point" if mode else "client",
+        }
 
-    async def async_turn_on(self, **_kwargs: Any) -> None:
-        """Queue the enable downlink and show it right away."""
-        await self._async_send(1)
+    async def _async_switch(self, *, on: bool) -> None:
+        await self.coordinator.members.async_set_wifi(
+            async_get_clientsession(self.hass), self._eui, enabled=on
+        )
 
-    async def async_turn_off(self, **_kwargs: Any) -> None:
-        """Queue the disable downlink and show it right away."""
-        await self._async_send(0)
+
+class MilesightFleetWireGuardSwitch(_MemberSwitch):
+    """One WireGuard interface of a fleet member."""
+
+    _attr_icon = "mdi:vpn"
+
+    def __init__(
+        self,
+        coordinator: MilesightDiagnosticsCoordinator,
+        gateway: FleetGateway,
+        entry_id: str,
+        gateway_id: str,
+        interface: WireGuardInterface,
+    ) -> None:
+        """Key it by gateway and interface; only the first one starts enabled."""
+        super().__init__(
+            coordinator, gateway, entry_id, gateway_id, f"wireguard_{interface.index}"
+        )
+        self._index = interface.index
+        self._attr_name = f"WireGuard {interface.name}"
+        # A gateway has three; most setups use one tunnel.
+        self._attr_entity_registry_enabled_default = interface.index == 1
+
+    @property
+    def _interface(self) -> WireGuardInterface | None:
+        member = self._member
+        return (
+            next((i for i in member.wireguard if i.index == self._index), None)
+            if member
+            else None
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return whether the interface is enabled."""
+        interface = self._interface
+        return interface.enabled if interface else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Tell the tunnel address and how many peers are set up."""
+        interface = self._interface
+        if interface is None:
+            return None
+        return {"address": interface.address, "peers": interface.peers}
+
+    async def _async_switch(self, *, on: bool) -> None:
+        await self.coordinator.members.async_set_wireguard(
+            async_get_clientsession(self.hass), self._eui, self._index, enabled=on
+        )

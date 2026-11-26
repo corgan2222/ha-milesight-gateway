@@ -2,18 +2,19 @@
 Milesight Gateway API wrapper.
 
 Uses MilesightGatewayClient from the Milesight-Gateway-API package to fetch
-devices from the gateway, then combines them with the devices_ha.json model
-database to produce fully-described MilesightDevice objects ready for HA.
+the gateway's device list, status and firmware. Each device's model comes from
+Milesight's codec catalog bundled with that package.
 """
 
 from __future__ import annotations
 
-import asyncio
+import base64
+import copy
 import json
 import logging
-import pathlib
+import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -24,8 +25,14 @@ from milesight_gateway_api import (
     MilesightGatewayClient,
     MilesightGatewayError,
     WebLoginRefusedError,
+    decoder,
+    download_firmware,
+    get_firmware_releases,
     get_latest_firmware,
 )
+from milesight_gateway_api.lorawan import identify, is_online
+
+from .const import DEVICE_TIMEOUT
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -34,341 +41,72 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-_DEVICES_DB_PATH = pathlib.Path(__file__).parent / "devices_ha.json"
-
-# Maps known entity keys to their HA metadata.
-# Only keys present here will become entities. A list gives one key several
-# entities; they need different platforms, since the unique id is the key.
-ENTITY_MAPPING: dict[str, dict[str, Any] | list[dict[str, Any]]] = {
-    "battery": {
-        "platform": "sensor",
-        "device_class": "battery",
-        "enabled_by_default": True,
-        "entity_category": "diagnostic",
-        "state_class": "measurement",
-        "unit": "%",
-    },
-    "temperature": {
-        "platform": "sensor",
-        "device_class": "temperature",
-        "enabled_by_default": True,
-        "state_class": "measurement",
-        "unit": "°C",
-    },
-    "humidity": {
-        "platform": "sensor",
-        "device_class": "humidity",
-        "enabled_by_default": True,
-        "state_class": "measurement",
-        "unit": "%",
-    },
-    "co2": {
-        "platform": "sensor",
-        "device_class": "carbon_dioxide",
-        "enabled_by_default": True,
-        "state_class": "measurement",
-        "unit": "ppm",
-    },
-    "pressure": {
-        "platform": "sensor",
-        "device_class": "atmospheric_pressure",
-        "enabled_by_default": True,
-        "state_class": "measurement",
-        "unit": "hPa",
-    },
-    "rssi": {
-        "platform": "sensor",
-        "device_class": "signal_strength",
-        "enabled_by_default": True,
-        "entity_category": "diagnostic",
-        "state_class": "measurement",
-        "unit": "dBm",
-    },
-    "loRaSNR": {
-        "platform": "sensor",
-        "icon": "mdi:signal",
-        "enabled_by_default": True,
-        "entity_category": "diagnostic",
-        "state_class": "measurement",
-        "unit": "dB",
-        "name": "LoRa SNR",
-    },
-    # Devices on a default codec get the gateway template's key instead.
-    "snr": {
-        "platform": "sensor",
-        "icon": "mdi:signal",
-        "enabled_by_default": True,
-        "entity_category": "diagnostic",
-        "state_class": "measurement",
-        "unit": "dB",
-        "name": "LoRa SNR",
-    },
-    "occupancy": {
-        "platform": "binary_sensor",
-        "device_class": "occupancy",
-        "enabled_by_default": True,
-    },
-    "people_total_counts": [
-        {
-            "platform": "binary_sensor",
-            "device_class": "occupancy",
-            "enabled_by_default": True,
-            "name": "Occupancy",
-        },
-        {
-            "platform": "sensor",
-            "icon": "mdi:account-group",
-            "state_class": "measurement",
-            "enabled_by_default": True,
-            "name": "People count",
-        },
-    ],
-    "pir": {
-        "platform": "binary_sensor",
-        "device_class": "motion",
-        "enabled_by_default": True,
-    },
-    "pir_trigger": {
-        "platform": "binary_sensor",
-        "device_class": "motion",
-        "enabled_by_default": True,
-    },
-    "liquid": {
-        "platform": "binary_sensor",
-        "device_class": "moisture",
-        "enabled_by_default": True,
-    },
-    "leakage_status": {
-        "platform": "binary_sensor",
-        "device_class": "moisture",
-        "enabled_by_default": True,
-    },
-    "door": {
-        "platform": "binary_sensor",
-        "device_class": "door",
-        "enabled_by_default": True,
-    },
-    "tamper": {
-        "platform": "binary_sensor",
-        "device_class": "tamper",
-        "enabled_by_default": True,
-        "entity_category": "diagnostic",
-    },
-    # WT101 reports 0 = installed, 1 = uninstalled; above zero reads as on.
-    "tamper_status": {
-        "platform": "binary_sensor",
-        "device_class": "tamper",
-        "enabled_by_default": True,
-        "entity_category": "diagnostic",
-        "name": "Tamper",
-    },
-    "window_detection": {
-        "platform": "binary_sensor",
-        "device_class": "window",
-        "enabled_by_default": True,
-        "name": "Window open",
-    },
-    "valve_opening": {
-        "platform": "sensor",
-        "icon": "mdi:pipe-valve",
-        "state_class": "measurement",
-        "enabled_by_default": True,
-        "unit": "%",
-        "name": "Valve opening",
-    },
-    # Stateless press events; the event platform maps the payload values.
-    "button": {
-        "platform": "event",
-        "enabled_by_default": True,
-        "name": "Button",
-    },
-    "button_event": {
-        "platform": "event",
-        "enabled_by_default": True,
-        "name": "Button",
-    },
-    # Marks the device as a thermostat; the climate platform reads the
-    # temperature keys itself and writes settings as downlinks.
-    "target_temperature": {
-        "platform": "climate",
-        "enabled_by_default": True,
-        "name": "Thermostat",
-    },
-    "sn": {
-        "platform": "sensor",
-        "enabled_by_default": False,
-        "entity_category": "diagnostic",
-    },
-    "devEUI": {
-        "platform": "sensor",
-        "enabled_by_default": False,
-        "entity_category": "diagnostic",
-        "name": "Device EUI",
-    },
-    "applicationName": {
-        "platform": "sensor",
-        "enabled_by_default": False,
-        "entity_category": "diagnostic",
-        "name": "Application",
-    },
-    "deviceName": {
-        "platform": "sensor",
-        "enabled_by_default": False,
-        "entity_category": "diagnostic",
-        "name": "Device name",
-    },
-    "mac": {
-        "platform": "sensor",
-        "enabled_by_default": False,
-        "entity_category": "diagnostic",
-        "name": "MAC",
-    },
-    "gw": {
-        "platform": "sensor",
-        "enabled_by_default": False,
-        "entity_category": "diagnostic",
-        "name": "Gateway",
-    },
-}
-
-
-def _format_name(key: str) -> str:
-    """Turn a snake_case or camelCase key into a readable name."""
-    return key.replace("_", " ").capitalize()
-
-
-@dataclass
-class EntityDefinition:
-    """Describes one measurable value exposed by a device."""
-
-    key: str
-    name: str
-    platform: str  # "sensor", "binary_sensor", "event" or "climate"
-    unit: str | None = None
-    device_class: str | None = None
-    state_class: str | None = None
-    entity_category: str | None = None
-    icon: str | None = None
-    enabled_by_default: bool = True
-
 
 @dataclass
 class MilesightDevice:
-    """A LoRaWAN device registered on the gateway."""
+    """A device the gateway's network server lists, with its catalog model."""
 
     dev_eui: str
     name: str
-    model: str  # human-readable description, e.g. "Indoor Ambience Monitoring Sensor"
-    model_id: str  # short device type ID from devices_ha.json, e.g. "am307l"
-    data_topic: str
-    entities: list[EntityDefinition] = field(default_factory=list)
+    model: str  # catalog description, e.g. "Indoor Ambience Monitoring Sensor"
+    model_id: str  # catalog model ID, e.g. "am307l"
+    # Whether the network server still hears it. A device that stopped
+    # reporting stays listed, so its entities stay, unavailable.
+    online: bool = True
+    # Minutes without an uplink after which the network server calls the
+    # device offline; its own setting per device.
+    timeout: int = DEVICE_TIMEOUT
+    # When the network server last heard the device, joins included.
+    last_seen: datetime | None = None
 
 
-def _load_devices_db() -> dict:
-    """Load the devices_ha.json model database."""
-    try:
-        return json.loads(_DEVICES_DB_PATH.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError, UnicodeDecodeError:
-        _LOGGER.exception("Failed to load devices_ha.json")
-        return {"devices": []}
+def _timeout(value: Any) -> int:
+    """Read the device timeout in minutes; foreign JSON, so anything may come."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return DEVICE_TIMEOUT
+    return int(value) if value > 0 else DEVICE_TIMEOUT
 
 
-def _get_device_details(
-    dev_eui: str, devices_db: dict, payload_name: str = ""
-) -> dict | None:
+def _seen_at(value: Any) -> datetime | None:
     """
-    Return the best-matching device model entry for this EUI.
+    Read the network server's "2026-11-27 04:01:15.51938 +0800 CST".
 
-    First, all entries whose ``deveui`` prefix (first 9 chars) matches are
-    collected.  If exactly one is found it is returned immediately.  When
-    multiple entries share the same prefix the ``payload_name`` from the
-    gateway is compared case-insensitively against the ``name`` field to pick
-    the correct model.  If no name match is found the first candidate is
-    returned with a warning so we always produce *some* result.
+    The gateway writes its own clock's zone, which may be far from the
+    house; the offset makes the moment exact. "-" means never.
     """
-    prefix = dev_eui[:9].lower()
-    candidates = [
-        d
-        for d in devices_db.get("devices", [])
-        if d.get("deveui", "").lower() == prefix and "device_entities" in d
-    ]
-
-    if not candidates:
+    if not isinstance(value, str):
         return None
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    # Strip known firmware-variant suffixes before comparing.
-    _payload_name_suffixes = ("_new", "_esec")
-    normalized = payload_name.lower()
-    for suffix in _payload_name_suffixes:
-        if normalized.endswith(suffix):
-            normalized = normalized[: -len(suffix)]
-            break
-
-    # Multiple models share this EUI prefix — try to disambiguate by name.
-    payload_name_lower = normalized
-    for candidate in candidates:
-        if candidate.get("name", "").lower() == payload_name_lower:
-            return candidate
-
-    _LOGGER.warning(
-        "Multiple model definitions found for EUI prefix %s (%s), "
-        "none matched payloadName %r (normalized: %r) — using first entry (%s)",
-        prefix,
-        [c.get("name") for c in candidates],
-        payload_name,
-        normalized,
-        candidates[0].get("name"),
-    )
-    return candidates[0]
-
-
-def _build_device(
-    raw_device: dict, device_details: dict, mqtt_base_topic: str
-) -> MilesightDevice:
-    """Build a MilesightDevice from gateway data + model definition."""
-    dev_eui = raw_device.get("devEUI", "")
-    name = raw_device.get("name") or "Unknown Device"
-    model = device_details.get("description") or device_details.get("name", "")
-    model_id = device_details.get("id", "")
-    data_topic = f"{mqtt_base_topic}/{dev_eui.lower()}"
-
-    seen_keys: set[str] = set()
-    entities: list[EntityDefinition] = []
-
-    for key in device_details.get("device_entities", []):
-        if key in seen_keys:
+    stamp = " ".join(value.split()[:3])
+    for layout in ("%Y-%m-%d %H:%M:%S.%f %z", "%Y-%m-%d %H:%M:%S %z"):
+        try:
+            return datetime.strptime(stamp, layout)  # noqa: DTZ007 - both carry %z
+        except ValueError:
             continue
-        seen_keys.add(key)
+    return None
 
-        mapping = ENTITY_MAPPING.get(key)
-        if mapping is None:
-            continue
 
-        entities.extend(
-            EntityDefinition(
-                key=key,
-                name=spec.get("name", _format_name(key)),
-                platform=spec.get("platform", "sensor"),
-                unit=spec.get("unit"),
-                device_class=spec.get("device_class"),
-                state_class=spec.get("state_class"),
-                entity_category=spec.get("entity_category"),
-                icon=spec.get("icon"),
-                enabled_by_default=spec.get("enabled_by_default", True),
-            )
-            for spec in (mapping if isinstance(mapping, list) else [mapping])
-        )
+def _catalog_device(raw: dict[str, Any]) -> MilesightDevice | None:
+    """
+    Describe a network server record by Milesight's codec catalog, or None.
 
+    The model comes from the assigned codec's name (``WT101``, ``VS340_esec``)
+    and falls back to the devEUI prefix, as the LoRaWAN source does it.
+    """
+    dev_eui = raw.get("devEUI")
+    if not isinstance(dev_eui, str) or not dev_eui:
+        return None
+    _brand, model_id = identify(raw)
+    model = decoder.models().get(model_id)
+    if model is None:
+        return None
     return MilesightDevice(
         dev_eui=dev_eui,
-        name=name,
-        model=model,
+        name=raw.get("name") or dev_eui,
+        model=model.get("description") or model["name"],
         model_id=model_id,
-        data_topic=data_topic,
-        entities=entities,
+        online=is_online(raw),
+        timeout=_timeout(raw.get("timeout")),
+        last_seen=_seen_at(raw.get("lastSeenAtTime")),
     )
 
 
@@ -387,6 +125,15 @@ class GatewayDetails:
     model_id: str | None
     serial_number: str | None
     hw_version: str | None
+    # From firmware 60.0.0.50 on; older firmware and the UG63 report none.
+    hostname: str | None = None
+
+
+# Role of a gateway in a Gateway Fleet, from the web interface's summary.
+FLEET_MASTER = "master"
+FLEET_NODE = "node"
+FLEET_STANDALONE = "standalone"
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 @dataclass(frozen=True)
@@ -397,6 +144,27 @@ class SystemStatus:
     memory_available: float | None
     storage_available: float | None
     uptime: int | None
+    fleet_role: str | None = None
+
+
+def fleet_role(system: dict[str, Any]) -> str | None:
+    """
+    Return whether the gateway leads a fleet, forwards to one, or stands alone.
+
+    A master counts fleet gateways. A node forwards its packets to a network
+    server elsewhere. Firmware without the packet forwarder block (UG63,
+    60.0.0.48 and older) tells neither, so the role stays unknown.
+    """
+    if (_int(system.get("gateway_fleet_total")) or 0) > 0:
+        return FLEET_MASTER
+    forwarder = system.get("packet_forwarder")
+    if not isinstance(forwarder, dict):
+        return None
+    for destination in _items(forwarder.get("destinations")):
+        address = str(destination.get("serv_addr") or "").strip().lower()
+        if destination.get("serv_enabled") is True and address not in _LOCAL_HOSTS:
+            return FLEET_NODE
+    return FLEET_STANDALONE
 
 
 @dataclass(frozen=True)
@@ -408,6 +176,14 @@ class FleetGateway:
     connected: bool | None
     # The gateway reports its local time without a zone.
     last_seen: datetime | None
+    # What the network server knows of a fleet member besides its radio; all
+    # None for the gateway it runs on, and on firmware without these fields.
+    wan_connected: bool | None = None
+    ip: str | None = None
+    uptime: int | None = None  # seconds
+    system_ok: bool | None = None
+    cellular_connected: bool | None = None
+    cellular_signal: int | None = None  # dBm
 
 
 @dataclass(frozen=True)
@@ -418,6 +194,19 @@ class ApplicationLink:
     name: str
     host: str | None
     connected: bool | None
+
+
+@dataclass(frozen=True)
+class MqttTopics:
+    """The topics one application's MQTT link uses, as the gateway names them."""
+
+    uplink: str
+    downlink: str | None = None
+    ack: str | None = None
+    error: str | None = None
+    join: str | None = None
+    request: str | None = None
+    response: str | None = None
 
 
 @dataclass(frozen=True)
@@ -489,6 +278,53 @@ def _percent(value: Any) -> float | None:
         return None
 
 
+def _share(part: Any, total: Any) -> float | None:
+    """Return part of total in percent; numbers may arrive as text."""
+    try:
+        part, total = float(part), float(total)
+    except TypeError, ValueError:
+        return None
+    if total <= 0 or not 0 <= part <= total:
+        return None
+    return round(part / total * 100, 2)
+
+
+_SIGNAL = re.compile(r"(-?\d+)\s*dBm")
+_NO_ADDRESS = ("", "0.0.0.0")  # noqa: S104 - what the gateway says for "none"
+
+
+def _connected(value: Any) -> bool | None:
+    """Read a "Connected" or "Disconnected" text; empty means not known."""
+    text = _text(value)
+    return None if text is None else text.lower() == "connected"
+
+
+def _fleet_detail(raw: Any) -> dict[str, Any]:
+    """Read a fleet gateway's detail; foreign JSON, so every field may be off."""
+    if not isinstance(raw, dict):
+        return {}
+    address = _text(raw.get("networkIP"))
+    try:
+        uptime = int(raw.get("systemRuntime"))
+    except TypeError, ValueError:
+        uptime = None
+    codes = raw.get("systemRunningStatus")
+    signal = _SIGNAL.search(str(raw.get("cellularSignal") or ""))
+    wan = _connected(raw.get("wanStatus"))
+    return {
+        "wan_connected": wan,
+        "ip": address if address not in _NO_ADDRESS else None,
+        "uptime": uptime if uptime and uptime > 0 else None,
+        # A list of codes; 0 alone is "Normal" on the gateway's own page.
+        "system_ok": codes == [0] if isinstance(codes, list) and codes else None,
+        # Without WAN data the gateway reports nothing about itself at all.
+        "cellular_connected": _connected(raw.get("cellularNetworkStatus"))
+        if wan is not None
+        else None,
+        "cellular_signal": int(signal.group(1)) if signal and wan is not None else None,
+    }
+
+
 def _local_time(value: Any) -> datetime | None:
     """Parse a "YYYY-MM-DD HH:MM:SS" time, which the gateway gives without zone."""
     if not isinstance(value, str):
@@ -530,6 +366,48 @@ async def async_get_latest_firmware(
     """Return the newest release of ``family`` from Milesight's download page."""
     with _as_api_error():
         return await get_latest_firmware(session, family)
+
+
+async def async_get_firmware_releases(
+    session: ClientSession, family: str
+) -> list[FirmwareRelease]:
+    """Return the releases of ``family`` on Milesight's download page, oldest first."""
+    with _as_api_error():
+        return await get_firmware_releases(session, family)
+
+
+async def async_download_firmware(
+    session: ClientSession, release: FirmwareRelease
+) -> bytes:
+    """
+    Download a release's image from Milesight.
+
+    Not through _as_api_error: this talks to Milesight, not to the gateway,
+    and an incomplete download is a ValueError, which there means a bad key.
+    """
+    try:
+        return await download_firmware(session, release)
+    except ValueError as err:
+        raise APIConnectionError(str(err)) from err
+    except (ClientError, TimeoutError) as err:
+        msg = f"Cannot download from Milesight: {err or type(err).__name__}"
+        raise APIConnectionError(msg) from err
+
+
+def system_status(system: dict[str, Any]) -> SystemStatus:
+    """Read the system block of a web interface's status summary."""
+    uptime = system.get("uptime")
+    memory = system.get("memory_avail_percent")
+    return SystemStatus(
+        cpu_load=_percent(system.get("cpu_load")),
+        # The UG63 reports no percentage, only free and total megabytes.
+        memory_available=_percent(memory)
+        if memory is not None
+        else _share(system.get("memory_free"), system.get("memory_total")),
+        storage_available=_percent(system.get("emmc_avail_percent")),
+        uptime=uptime if isinstance(uptime, int) and uptime >= 0 else None,
+        fleet_role=fleet_role(system),
+    )
 
 
 class APIAuthError(Exception):
@@ -585,6 +463,10 @@ def _as_api_error() -> Iterator[None]:
         raise APIConnectionError(msg) from err
 
 
+# For the modules that talk to a gateway with a client of their own.
+as_api_error = _as_api_error
+
+
 class MilesightGatewayAPI:
     """Wraps MilesightGatewayClient with HA-friendly async methods."""
 
@@ -597,12 +479,16 @@ class MilesightGatewayAPI:
         password: str,
         secret_key: str,
         iv: str,
-        mqtt_base_topic: str,
     ) -> None:
         """Initialize."""
         self.connected: bool = False
-        self._mqtt_base_topic = mqtt_base_topic
-        self._devices_db: dict = {}
+        self._account = {
+            "username": username,
+            "password": password,
+            "secret_key": secret_key.encode("utf-8"),
+            "iv": iv.encode("utf-8"),
+            "port": port,
+        }
         self._client = MilesightGatewayClient(
             username=username,
             password=password,
@@ -611,6 +497,22 @@ class MilesightGatewayAPI:
             base_url=gateway_url,
             port=port,
         )
+
+    @property
+    def client(self) -> MilesightGatewayClient:
+        """The client of the gateway itself, with its web session."""
+        return self._client
+
+    def member_client(self, address: str) -> MilesightGatewayClient:
+        """Return a client for a fleet member at that address, with this account."""
+        # Fleet members answer on HTTPS, whatever the hub's own URL says.
+        return MilesightGatewayClient(base_url=f"https://{address}", **self._account)
+
+    def around(self, client: MilesightGatewayClient) -> MilesightGatewayAPI:
+        """Return these calls for another gateway's client, such as a member's."""
+        other = copy.copy(self)
+        other._client = client  # noqa: SLF001 - a copy of this very class
+        return other
 
     @property
     def web_login_refused(self) -> bool:
@@ -623,7 +525,6 @@ class MilesightGatewayAPI:
 
     async def async_connect(self, session: ClientSession) -> bool:
         """Authenticate and obtain a JWT token from the gateway."""
-        self._devices_db = await asyncio.to_thread(_load_devices_db)
         self.connected = False
 
         with _as_api_error():
@@ -653,6 +554,18 @@ class MilesightGatewayAPI:
             raise APIConnectionError(msg)
         return GatewayInfo(model=_text(payload.get("model")), firmware=version)
 
+    async def async_download_backup(self, session: ClientSession) -> bytes:
+        """Return the gateway's full configuration backup."""
+        with _as_api_error():
+            return await self._client.download_backup(session)
+
+    async def async_upgrade_firmware(
+        self, session: ClientSession, image: bytes
+    ) -> None:
+        """Upload a firmware image; the gateway installs it and reboots."""
+        with _as_api_error():
+            await self._client.upgrade_firmware(session, image)
+
     async def async_get_gateway_details(self, session: ClientSession) -> GatewayDetails:
         """Return the gateway's model number, serial number and hardware version."""
         system = await self._async_web_system(session)
@@ -660,18 +573,12 @@ class MilesightGatewayAPI:
             model_id=_text(system.get("model")),
             serial_number=_text(system.get("sn")),
             hw_version=_text(system.get("hardware_ver")),
+            hostname=_text(system.get("hostname")),
         )
 
     async def async_get_system_status(self, session: ClientSession) -> SystemStatus:
         """Return CPU load, free memory and storage, and uptime."""
-        system = await self._async_web_system(session)
-        uptime = system.get("uptime")
-        return SystemStatus(
-            cpu_load=_percent(system.get("cpu_load")),
-            memory_available=_percent(system.get("memory_avail_percent")),
-            storage_available=_percent(system.get("emmc_avail_percent")),
-            uptime=uptime if isinstance(uptime, int) and uptime >= 0 else None,
-        )
+        return system_status(await self._async_web_system(session))
 
     async def _async_web_system(self, session: ClientSession) -> dict[str, Any]:
         """
@@ -716,6 +623,21 @@ class MilesightGatewayAPI:
             _, profile_count = await client.get_profiles(session, "0")
             packets = await client.get_packets(session, PACKET_WINDOW)
 
+        local = _text(forwarder.get("gatewayEui"))
+        details: dict[str, dict[str, Any]] = {}
+        for gw in _items(gateways.get("result")):
+            mac = gw.get("mac")
+            if not mac or (local and str(mac).upper() == local.upper()):
+                continue  # about itself the network server knows nothing here
+            try:
+                with _as_api_error():
+                    details[str(mac)] = _fleet_detail(
+                        await client.get_gateway(session, str(mac))
+                    )
+            except APIConnectionError as err:
+                # One member's detail is no reason to lose the whole status.
+                _LOGGER.debug("No detail of fleet gateway %s: %s", mac, err)
+
         links = []
         for app in _items(apps.get("result")):
             # Only applications with devices forward anything; the others are
@@ -755,6 +677,7 @@ class MilesightGatewayAPI:
                     if isinstance(gw.get("connected"), bool)
                     else None,
                     last_seen=_local_time(gw.get("lastSeenAt")),
+                    **details.get(str(gw.get("mac")), {}),
                 )
                 for gw in _items(gateways.get("result"))
                 if gw.get("mac")
@@ -771,41 +694,60 @@ class MilesightGatewayAPI:
             ],
         )
 
+    async def async_get_mqtt_topics(self, session: ClientSession) -> list[MqttTopics]:
+        """Return the MQTT topics of every application that publishes by MQTT."""
+        client = self._client
+        with _as_api_error():
+            apps = await client.get_applications(session)
+        found = []
+        for app in _items(apps.get("result")):
+            if "URMQTT" not in (app.get("kinds") or []):
+                continue
+            with _as_api_error():
+                mqtt = await client.get_data_transmission_integration(
+                    session, app.get("id"), "mqtt"
+                )
+            if isinstance(mqtt, dict) and (uplink := _text(mqtt.get("uplinkTopic"))):
+                found.append(
+                    MqttTopics(
+                        uplink=uplink,
+                        downlink=_text(mqtt.get("downlinkTopic")),
+                        ack=_text(mqtt.get("ackTopic")),
+                        error=_text(mqtt.get("errorTopic")),
+                        join=_text(mqtt.get("joinTopic")),
+                        request=_text(mqtt.get("requestTopic")),
+                        response=_text(mqtt.get("responseTopic")),
+                    )
+                )
+        return found
+
     async def async_enqueue_downlink(
         self,
         session: ClientSession,
         dev_eui: str,
-        command: dict[str, Any],
+        data: bytes,
         *,
         fport: int = 85,
-        confirmed: bool = False,
+        reference: str | None = None,
     ) -> None:
-        """Queue a downlink; the gateway delivers it after the next uplink."""
-        try:
-            await self._async_post_downlink(
-                session, dev_eui, command, fport=fport, confirmed=confirmed
-            )
-        except APIAuthError:
-            # An expired JWT looks like bad credentials; log in once more.
-            await self.async_connect(session)
-            await self._async_post_downlink(
-                session, dev_eui, command, fport=fport, confirmed=confirmed
-            )
+        """
+        Queue encoded bytes; the gateway delivers them after the next uplink.
 
-    async def _async_post_downlink(
-        self,
-        session: ClientSession,
-        dev_eui: str,
-        command: dict[str, Any],
-        *,
-        fport: int,
-        confirmed: bool,
-    ) -> None:
-        """Hand one queue item to the client, translating any failure."""
-        with _as_api_error():
-            await self._client.enqueue_downlink(
-                session, dev_eui, command, fport=fport, confirmed=confirmed
-            )
+        The bytes pass the device's payload codec, so a gateway codec without
+        an encoder does not matter. With a reference the downlink is
+        confirmed: the gateway reports its ACK on the application's MQTT ACK
+        topic and repeats the reference there (checked 2026-11-26, firmware
+        60.0.0.51).
+        """
+        body: dict[str, Any] = {
+            "confirmed": reference is not None,
+            "devEUI": dev_eui,
+            "fPort": fport,
+            "data": base64.b64encode(data).decode("ascii"),
+        }
+        if reference is not None:
+            body["reference"] = reference
+        await self.async_ns_call(session, "POST", f"/api/devices/{dev_eui}/queue", body)
 
     async def _fetch_devices(self, session: ClientSession) -> list[dict]:
         """Fetch the raw device list, translating any failure."""
@@ -814,6 +756,57 @@ class MilesightGatewayAPI:
                 session, limit=DEVICE_PAGE_SIZE
             )
         return all_devices
+
+    async def async_ns_call(
+        self,
+        session: ClientSession,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call the network server's API; an expired login is renewed once."""
+        try:
+            return await self._async_ns_call(session, method, path, body)
+        except APIAuthError:
+            await self.async_connect(session)
+            return await self._async_ns_call(session, method, path, body)
+
+    async def _async_ns_call(
+        self,
+        session: ClientSession,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        client = self._client
+        with _as_api_error():
+            async with session.request(
+                method,
+                f"{client.api_url}{path}",
+                json=body,
+                headers=client.headers,
+                ssl=False,
+            ) as response:
+                response.raise_for_status()
+                data = await response.json(content_type=None)
+        data = data if isinstance(data, dict) else {}
+        if data.get("error"):
+            msg = f"{method} {path}: {data['error']}"
+            raise APIConnectionError(msg)
+        return data
+
+    async def async_get_device_euis(self, session: ClientSession) -> set[str]:
+        """Return every devEUI the network server knows, active or not."""
+        try:
+            all_devices = await self._fetch_devices(session)
+        except APIAuthError:
+            await self.async_connect(session)
+            all_devices = await self._fetch_devices(session)
+        return {
+            raw["devEUI"].upper()
+            for raw in all_devices
+            if isinstance(raw, dict) and isinstance(raw.get("devEUI"), str)
+        }
 
     async def async_get_devices(
         self, session: ClientSession
@@ -834,25 +827,18 @@ class MilesightGatewayAPI:
         for raw in all_devices:
             if not isinstance(raw, dict):
                 continue
-            if raw.get("active"):
+            # "active" stays true for a device that stopped reporting; the
+            # network server's status tells. One it deactivated is left out.
+            if is_online(raw):
                 online_count += 1
             else:
                 offline_count += 1
+            if not raw.get("active"):
                 continue
 
-            dev_eui = raw.get("devEUI")
-            if not isinstance(dev_eui, str) or not dev_eui:
+            if (device := _catalog_device(raw)) is None:
+                _LOGGER.debug("No catalog model for device %s", raw.get("devEUI"))
                 continue
-
-            # The gateway sends null for a device without a payload codec.
-            payload_name = raw.get("payloadName") or ""
-            device_details = _get_device_details(
-                dev_eui, self._devices_db, payload_name
-            )
-            if not device_details:
-                _LOGGER.debug("No model definition found for device %s", dev_eui)
-                continue
-
-            result.append(_build_device(raw, device_details, self._mqtt_base_topic))
+            result.append(device)
 
         return result, online_count, offline_count

@@ -2,5 +2,5 @@ colorlog==6.12.0
 homeassistant==2026.9.3
 pip>=26.3
 ruff==0.17.6
-Milesight-Gateway-API[decoder]==0.2.0b1
+Milesight-Gateway-API[decoder]==1.0.1
 lorawan-connection==1.3.2

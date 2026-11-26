@@ -1,9 +1,9 @@
 """Smoke tests for the Milesight Gateway integration.
 
-These validate the integration's static metadata and the bundled device
-database without requiring a running Home Assistant instance, so they give a
-fast, reliable CI baseline. Build behaviour tests (config flow, coordinator,
-sensors) on top of this scaffold using the
+These validate the integration's static metadata without requiring a running
+Home Assistant instance, so they give a fast, reliable CI baseline. Build
+behaviour tests (config flow, coordinator, sensors) on top of this scaffold
+using the
 ``pytest-homeassistant-custom-component`` fixtures provided in ``conftest.py``.
 """
 
@@ -44,9 +44,3 @@ def test_manifest_has_version_and_requirements():
     manifest = _manifest()
     assert manifest.get("version"), "manifest.json must declare a version"
     assert "requirements" in manifest, "manifest.json must declare requirements"
-
-
-def test_device_database_is_valid_json():
-    """The bundled device database parses and is non-empty."""
-    data = json.loads((INTEGRATION_DIR / "devices_ha.json").read_text("utf-8"))
-    assert data, "devices_ha.json must not be empty"
