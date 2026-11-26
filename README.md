@@ -4,7 +4,7 @@
 
 # Milesight Gateway for Home Assistant
 
-[![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=corgan2222&repository=ha-milesight-gateway&category=integration)
+[![Open your Home Assistant instance and open this repository in the Marketplace.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=corgan2222&repository=ha-milesight-gateway&category=integration)
 [![Add the integration to your Home Assistant instance.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=milesight_gateway)
 
 Brings Milesight LoRaWAN gateways (UG65, UG67 and their relatives) and the
@@ -33,8 +33,8 @@ gateway's own status and a map of the radio network.
 
 ## Installation
 
-The integration is in the HACS default list. In HACS, search for **Milesight
-Gateway**, download it and restart Home Assistant. Without HACS, copy
+The integration is in the Marketplace default list. In the Marketplace, search for **Milesight
+Gateway**, download it and restart Home Assistant. Without the Marketplace, copy
 `custom_components/milesight_gateway` into `config/custom_components/` and
 restart.
 
