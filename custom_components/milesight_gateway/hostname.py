@@ -17,16 +17,56 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import format_mac
 
-from .const import CONF_GATEWAY_URL, CONF_HOSTNAME, CONF_MAC, entry_title, gateway_name
+from .const import (
+    CONF_GATEWAY_URL,
+    CONF_HOSTNAME,
+    CONF_MAC,
+    CONF_MODEL,
+    entry_title,
+    gateway_name,
+)
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import State
 
 
+# The model the gateway device is registered with until the gateway names one.
+_GENERIC_MODEL = "LoRaWAN Gateway"
 # A DHCP hostname label. Some trackers put the vendor there instead
 # ("Xiamen Milesight IoT Co., Ltd."), which is no name of this gateway.
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
+# A title that is only an address, as the setup gave one: "https://192.0.2.10".
+_ADDRESS = re.compile(r"^https?://[^/\s]+/?$")
+# The address a title ends with: "GW-8 - UG65 (192.0.2.10)".
+_IN_BRACKETS = re.compile(r" \([^()]*\)$")
+
+
+def given_title(title: str, data: dict, model: str | None = None) -> bool:
+    """
+    Tell whether a title is one the integration gave, not one the user chose.
+
+    Such a title follows a new hostname, model or address. The address in
+    it is left out of the comparison: the gateway may have moved since.
+    """
+    if _ADDRESS.match(title):
+        return True
+    without = {key: value for key, value in data.items() if key != CONF_HOSTNAME}
+    candidates = [entry_title(data), entry_title(without), gateway_name(data)]
+    if model:
+        candidates.append(entry_title({**without, CONF_MODEL: model}))
+    plain = _IN_BRACKETS.sub("", title)
+    return any(
+        candidate and plain == _IN_BRACKETS.sub("", candidate)
+        for candidate in candidates
+    )
+
+
+def fitting_title(data: dict, model: str | None = None) -> str:
+    """Return the title for this data; the model from the device if not stored."""
+    if model and not data.get(CONF_MODEL):
+        data = {**data, CONF_MODEL: model}
+    return entry_title(data)
 
 
 def short_hostname(name: str | None) -> str | None:
@@ -62,17 +102,16 @@ def learn_hostname(
     stored = entry.data.get(CONF_HOSTNAME)
     without = {key: value for key, value in entry.data.items() if key != CONF_HOSTNAME}
     url = urlsplit(entry.data.get(CONF_GATEWAY_URL, ""))
-    # Titles the setup gave, this version's and older ones (the 1.5.0 beta
-    # named an entry without its address), so a chosen title stays.
-    given = {
-        entry_title(entry.data),
-        entry_title(without),
-        url.geturl(),
-        gateway_name(entry.data),
-    }
+    registry = dr.async_get(hass)
+    device = registry.async_get(gateway_device_id)
+    # An entry from before the setup asked for the model takes it from the
+    # device, for the title only: the device keeps its name and entity IDs.
+    model = device.model if device and device.model != _GENERIC_MODEL else None
+    given = given_title(entry.title, entry.data, model)
     if stored and short_hostname(stored) == stored:
-        if entry.title in given and entry.title != entry_title(entry.data):
-            hass.config_entries.async_update_entry(entry, title=entry_title(entry.data))
+        title = fitting_title(entry.data, model)
+        if given and entry.title != title:
+            hass.config_entries.async_update_entry(entry, title=title)
         return
     # A stored name that is no hostname (1.5.0 beta took a tracker's vendor
     # text) is replaced, or dropped when nothing better is known.
@@ -80,12 +119,14 @@ def learn_hostname(
         hass, entry.data.get(CONF_MAC), url.hostname
     )
     if not hostname and not stored:
+        title = fitting_title(entry.data, model)
+        if given and entry.title != title:
+            hass.config_entries.async_update_entry(entry, title=title)
         return
     data = {**without, CONF_HOSTNAME: hostname} if hostname else without
-    title = entry_title(data) if entry.title in given else entry.title
+    title = fitting_title(data, model) if given else entry.title
     hass.config_entries.async_update_entry(entry, data=data, title=title)
-    registry = dr.async_get(hass)
-    if device := registry.async_get(gateway_device_id):
+    if device:
         registry.async_update_device(
             device.id, name=gateway_name(data) or "Milesight Gateway"
         )

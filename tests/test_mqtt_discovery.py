@@ -32,7 +32,7 @@ from custom_components.milesight_gateway.const import (
     DOMAIN,
     entry_title,
 )
-from custom_components.milesight_gateway.hostname import short_hostname
+from custom_components.milesight_gateway.hostname import given_title, short_hostname
 from custom_components.milesight_gateway.mqtt_discovery import (
     TopicTemplate,
     guess_model,
@@ -398,3 +398,57 @@ async def test_a_beta_title_gets_its_address_back(hass, mqtt_mock, gateway):
     await hass.async_block_till_done()
 
     assert entry.title == "gw_mini - UG63 (192.0.2.10)"
+
+
+async def test_an_entry_without_a_stored_model_is_named_after_the_device(
+    hass, mqtt_mock, gateway
+):
+    """Set up before the setup asked for the model: the title takes it all the same."""
+    data = {key: value for key, value in ENTRY_DATA.items() if key != CONF_MODEL}
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=data, title="http://192.0.2.10", version=1, minor_version=2
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.title == "Milesight UG63 (192.0.2.10)"
+    assert CONF_MODEL not in entry.data
+    gateway_device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, entry.entry_id), entry.entry_id
+    )
+    # The device keeps its name, so entity IDs made later keep their prefix.
+    assert gateway_device.name == "Milesight Gateway"
+
+
+async def test_a_title_with_an_old_address_follows_the_new_one(
+    hass, mqtt_mock, gateway
+):
+    """The gateway moved; a title the integration gave moves along."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=ENTRY_DATA,
+        title="https://192.0.2.99",
+        version=1,
+        minor_version=2,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.title == "Milesight UG63 (192.0.2.10)"
+
+
+@pytest.mark.parametrize(
+    ("title", "given"),
+    [
+        ("https://192.0.2.99", True),
+        ("http://192.0.2.10/", True),
+        ("Milesight UG63 (192.0.2.99)", True),
+        ("gw_mini - UG63 (192.0.2.99)", False),
+        ("Lab", False),
+        ("Lab (192.0.2.10)", False),
+    ],
+)
+def test_only_titles_the_integration_gave_are_replaced(title, given):
+    assert given_title(title, ENTRY_DATA) is given

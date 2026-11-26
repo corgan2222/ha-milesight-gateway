@@ -78,7 +78,7 @@ from .const import (
     gateway_only,
 )
 from .coordinator import status_interval
-from .hostname import short_hostname, tracker_hostname
+from .hostname import given_title, short_hostname, tracker_hostname
 from .mqtt_discovery import (
     downlink_error,
     request_error,
@@ -361,14 +361,16 @@ class MilesightGatewayConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_MAC: mac,
                 }
                 # A hostname the gateway reports itself stays.
-                title = entry.title
                 if not entry.data.get(CONF_HOSTNAME) and (
                     name := short_hostname(discovery_info.hostname)
                 ):
                     updates[CONF_HOSTNAME] = name
-                    # The title follows, unless the user chose one.
-                    if title in (entry_title(entry.data), url.geturl()):
-                        title = entry_title({**entry.data, **updates})
+                # The title follows name and address, unless the user chose one.
+                title = (
+                    entry_title({**entry.data, **updates})
+                    if given_title(entry.title, dict(entry.data))
+                    else entry.title
+                )
                 return self.async_update_reload_and_abort(
                     entry,
                     unique_id=mac,
