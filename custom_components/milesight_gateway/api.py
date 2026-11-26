@@ -358,12 +358,19 @@ async def async_get_firmware_releases(
 async def async_download_firmware(
     session: ClientSession, release: FirmwareRelease
 ) -> bytes:
-    """Download a release's image from Milesight."""
+    """
+    Download a release's image from Milesight.
+
+    Not through _as_api_error: this talks to Milesight, not to the gateway,
+    and an incomplete download is a ValueError, which there means a bad key.
+    """
     try:
-        with _as_api_error():
-            return await download_firmware(session, release)
+        return await download_firmware(session, release)
     except ValueError as err:
         raise APIConnectionError(str(err)) from err
+    except (ClientError, TimeoutError) as err:
+        msg = f"Cannot download from Milesight: {err or type(err).__name__}"
+        raise APIConnectionError(msg) from err
 
 
 def system_status(system: dict[str, Any]) -> SystemStatus:

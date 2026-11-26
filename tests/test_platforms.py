@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import ClientError
 from homeassistant.components.diagnostics import REDACTED
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.const import (
@@ -1006,7 +1007,7 @@ async def test_a_failed_backup_stops_the_installation(
             AsyncMock(side_effect=APIConnectionError("no backup")),
         ),
         patch.object(MilesightGatewayAPI, "async_upgrade_firmware", upload),
-        pytest.raises(HomeAssistantError, match="not installed"),
+        pytest.raises(HomeAssistantError, match="the backup failed: no backup"),
     ):
         await hass.services.async_call(
             "update", "install", {"entity_id": FIRMWARE}, blocking=True
@@ -1131,3 +1132,69 @@ async def test_the_dialog_gets_the_notes_in_full(
         {"type": "update/release_notes", "entity_id": FIRMWARE}
     )
     assert (await client.receive_json())["result"] == notes
+
+
+@pytest.mark.parametrize(
+    ("failure", "said"),
+    [
+        (ClientError("Server disconnected"), "Cannot download from Milesight"),
+        (ValueError("The download of firmware 60.0.0.51 is incomplete"), "incomplete"),
+    ],
+)
+async def test_a_failed_download_names_milesight_not_the_gateway(
+    hass, mqtt, get_devices, firmware, failure, said
+):
+    """The image comes from Milesight; neither the gateway nor a key is to blame."""
+    await _setup_on(hass, firmware, "60.0.0.45")
+    upload = AsyncMock()
+
+    with (
+        patch.object(
+            MilesightGatewayAPI, "async_download_backup", AsyncMock(return_value=b"x")
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.save_backup",
+            MagicMock(return_value="/config/x.backup"),
+        ),
+        patch(
+            "custom_components.milesight_gateway.api.download_firmware",
+            AsyncMock(side_effect=failure),
+        ),
+        patch.object(MilesightGatewayAPI, "async_upgrade_firmware", upload),
+        pytest.raises(HomeAssistantError) as raised,
+    ):
+        await hass.services.async_call(
+            "update", "install", {"entity_id": FIRMWARE}, blocking=True
+        )
+
+    assert "the download from Milesight failed" in str(raised.value)
+    assert said in str(raised.value)
+    assert "gateway" not in str(raised.value).split("failed:")[1]
+    upload.assert_not_awaited()
+
+
+async def test_a_failed_upload_says_so(hass, mqtt, get_devices, firmware):
+    await _setup_on(hass, firmware, "60.0.0.45")
+
+    with (
+        patch.object(
+            MilesightGatewayAPI, "async_download_backup", AsyncMock(return_value=b"x")
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.save_backup",
+            MagicMock(return_value="/config/x.backup"),
+        ),
+        patch(
+            "custom_components.milesight_gateway.coordinator.async_download_firmware",
+            AsyncMock(return_value=b"image"),
+        ),
+        patch.object(
+            MilesightGatewayAPI,
+            "async_upgrade_firmware",
+            AsyncMock(side_effect=APIConnectionError("Server disconnected")),
+        ),
+        pytest.raises(HomeAssistantError, match="the upload to the gateway failed"),
+    ):
+        await hass.services.async_call(
+            "update", "install", {"entity_id": FIRMWARE}, blocking=True
+        )

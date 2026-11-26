@@ -232,21 +232,28 @@ async def async_install_firmware(  # noqa: PLR0913
     it nothing is uploaded.
     """
     session: ClientSession = async_get_clientsession(hass)
+    # Named in the error, so a failure says where it stopped.
+    doing = "backup"
     try:
         progress(5)
         backup = await api.async_download_backup(session)
         saved = await hass.async_add_executor_job(
             save_backup, hass.config.path(BACKUP_FOLDER), address, installed, backup
         )
-        _LOGGER.info("Backup of the gateway before the upgrade: %s", saved)
+        _LOGGER.info("Backup of %s before the upgrade: %s", address, saved)
         progress(20)
+        doing = "download from Milesight"
         image = await async_download_firmware(session, step)
+        _LOGGER.info("Downloaded firmware %s, %s bytes", step.version, len(image))
         progress(50)
+        doing = "upload to the gateway"
         await api.async_upgrade_firmware(session, image)
+        _LOGGER.info("%s took firmware %s and installs it", address, step.version)
         progress(70)
+        doing = "wait for the new version"
         await _async_wait_for(api, session, step.version)
     except (APIAuthError, APIConnectionError, OSError) as err:
-        msg = f"The firmware was not installed: {err}"
+        msg = f"The firmware was not installed, the {doing} failed: {err}"
         raise HomeAssistantError(msg) from err
 
 
